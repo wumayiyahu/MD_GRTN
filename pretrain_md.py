@@ -79,7 +79,7 @@ print("=" * 50)
 # 使用MD-GRTN专用数据加载器，模式为'pretrain'
 train_loader, _, _, _, _, _, _, _ = load_md_grtn_data(
     graph_signal_matrix_filename,
-    num_of_hours, num_of_days, num_of_weeks,
+    num_of_hours, num_of_days, num_of_weeks, num_for_predict,
     DEVICE, batch_size, shuffle=True, mode='pretrain'
 )
 print(f"训练批次: {len(train_loader)}")
@@ -87,7 +87,7 @@ print(f"训练批次: {len(train_loader)}")
 # 为验证集加载主训练数据
 _, _, val_loader, val_target_tensor, test_loader, test_target_tensor, _, _ = load_md_grtn_data(
     graph_signal_matrix_filename,
-    num_of_hours, num_of_days, num_of_weeks,
+    num_of_hours, num_of_days, num_of_weeks, num_for_predict,
     DEVICE, batch_size, shuffle=False, mode='train'
 )
 

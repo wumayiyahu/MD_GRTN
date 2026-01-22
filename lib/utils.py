@@ -122,7 +122,7 @@ def cheb_polynomial(L_tilde, K):
     return cheb_polynomials
 
 
-def load_md_grtn_data(graph_signal_matrix_filename, num_of_hours, num_of_days, num_of_weeks, DEVICE, batch_size,
+def load_md_grtn_data(graph_signal_matrix_filename, num_of_hours, num_of_days, num_of_weeks, num_for_predict, DEVICE, batch_size,
                       shuffle=True, mode='train'):
     '''
     为MD-GRTN模型准备数据
@@ -134,6 +134,7 @@ def load_md_grtn_data(graph_signal_matrix_filename, num_of_hours, num_of_days, n
     num_of_hours: int, 小时周期数
     num_of_days: int, 日周期数
     num_of_weeks: int, 周周期数
+    num_for_predict: int, 预测时间步数
     DEVICE: torch.device
     batch_size: int
     shuffle: bool
@@ -146,15 +147,17 @@ def load_md_grtn_data(graph_signal_matrix_filename, num_of_hours, num_of_days, n
 
     file = os.path.basename(graph_signal_matrix_filename).split('.')[0]
     dirpath = os.path.dirname(graph_signal_matrix_filename)
-
-    # MD-GRTN专用数据文件
+    
+    # MD-GRTN专用数据文件（包含预测步数num_for_predict参数）
+    # 注意：文件名格式从 prepareData.py 改为包含 _p{num_for_predict}
     filename = os.path.join(dirpath, file + '_md_grtn' +
                             '_w' + str(num_of_weeks) +
                             '_d' + str(num_of_days) +
-                            '_h' + str(num_of_hours) + '.npz')
-
+                            '_h' + str(num_of_hours) +
+                            '_p' + str(num_for_predict) + '.npz')
+    
     print('加载MD-GRTN数据文件:', filename)
-
+    
     if not os.path.exists(filename):
         raise FileNotFoundError(f"MD-GRTN数据文件不存在: {filename}. 请先运行数据预处理脚本。")
 

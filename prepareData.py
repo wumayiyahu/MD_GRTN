@@ -512,8 +512,8 @@ def main():
                        help='配置文件路径')
     parser.add_argument('--original_data', type=str, 
                        help='原始数据路径（覆盖配置文件设置）')
-    parser.add_argument('--output_dir', type=str, default='data/MD_GRTN',
-                       help='输出目录')
+    parser.add_argument('--output_dir', type=str, default=None,
+                       help='输出目录（默认使用原始数据所在目录）')
     parser.add_argument('--noise_level', type=float, default=0.05,
                        help='噪声水平（0-1）')
     parser.add_argument('--missing_rate', type=float, default=0.02,
@@ -558,7 +558,12 @@ def main():
     # 生成输出文件名
     dataset_name = os.path.basename(original_data_path).replace('.npz', '')
     output_filename = f"{dataset_name}_md_grtn_w{num_of_weeks}_d{num_of_days}_h{num_of_hours}_p{num_for_predict}.npz"
-    output_path = os.path.join(args.output_dir, output_filename)
+    
+    # 如果没有指定输出目录，使用原始数据所在的目录
+    if args.output_dir is None:
+        output_path = os.path.join(os.path.dirname(original_data_path), output_filename)
+    else:
+        output_path = os.path.join(args.output_dir, output_filename)
     
     # 创建数据
     dataset = prepare_md_grtn_dataset(
