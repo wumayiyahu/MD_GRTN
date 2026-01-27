@@ -14,7 +14,7 @@ from model.MD_GRTN_r import make_model
 # 修改导入
 from lib.utils import load_md_grtn_data, get_adjacency_matrix, compute_val_loss, predict_and_save_results
 from tensorboardX import SummaryWriter
-from lib.metrics import masked_mae, masked_mse, masked_rmse, masked_mape
+from lib.metrics import masked_mae, masked_mse, masked_rmse, masked_mape, masked_huber_loss
 
 # ---------------------- 参数 ----------------------
 parser = argparse.ArgumentParser()
@@ -48,15 +48,31 @@ learning_rate = float(training_config['learning_rate'])
 epochs = int(training_config['epochs'])
 start_epoch = int(training_config['start_epoch'])
 
-num_of_hours = int(training_config['num_of_hours'])
-num_of_days = int(training_config['num_of_days'])
-num_of_weeks = int(training_config['num_of_weeks'])
+# 根据论文符号定义的参数说明：
+# num_of_hours  → 论文中的 Rec (最近连续时间)
+# num_of_days   → 论文中的 Hour (小时周期，24小时模式)
+# num_of_weeks  → 论文中的 Day (日周期，7天模式)
+#
+# 数据流：
+# X_Rec  (num_of_hours步)  → 传入第一个参数 (rec_data)
+# X_Hour (num_of_days步)   → 传入第二个参数 (hour_data)
+# X_Day  (num_of_weeks步)  → 传入第三个参数 (day_data)
+
+num_of_hours = int(training_config['num_of_hours'])   # 论文 Rec 周期
+num_of_days = int(training_config['num_of_days'])    # 论文 Hour 周期
+num_of_weeks = int(training_config['num_of_weeks'])  # 论文 Day 周期
 
 # MD-GRTN模型参数
 in_channels = int(training_config['in_channels'])
-hidden_dim = int(training_config.get('hidden_dim', 64))
-num_heads = int(training_config.get('num_heads', 4))
-num_layers = int(training_config.get('num_layers', 2))
+hidden_dim = int(training_config.get('hidden_dim', '64'))
+num_heads = int(training_config.get('num_heads', '4')) #应该是3
+num_layers = int(training_config.get('num_layers', '2'))
+
+# 参数验证
+if hidden_dim % num_heads != 0:
+    print(f"警告: hidden_dim={hidden_dim} 不能被 num_heads={num_heads} 整除")
+    print(f"自动调整 num_heads 为 4 (64 可被 4 整除)")
+    num_heads = 4
 
 loss_function = training_config['loss_function']
 metric_method = training_config['metric_method']
@@ -75,13 +91,21 @@ print("加载MD-GRTN主训练数据")
 print("=" * 50)
 
 # 使用MD-GRTN专用数据加载器，模式为'train'
-#返回：train_loader, train_target, val_loader, val_target, test_loader, test_target
+# 返回：train_loader, train_target, val_loader, val_target, test_loader, test_target
+# 数据映射（根据论文符号）：
+# - num_of_hours  → X_Rec (最近连续时间)
+# - num_of_days   → X_Hour (小时周期，24小时模式)
+# - num_of_weeks  → X_Day (日周期，7天模式)
 train_loader, train_target_tensor, val_loader, val_target_tensor, test_loader, test_target_tensor, _, _ = load_md_grtn_data(
     graph_signal_matrix_filename,
     num_of_hours, num_of_days, num_of_weeks, num_for_predict,
     DEVICE, batch_size, shuffle=True, mode='train'
 )
 
+print(f"数据集信息（根据论文符号定义）:")
+print(f"  X_Rec (num_of_hours={num_of_hours}): 最近连续时间")
+print(f"  X_Hour (num_of_days={num_of_days}): 小时周期（24小时模式）")
+print(f"  X_Day (num_of_weeks={num_of_weeks}): 日周期（7天模式）")
 print(f"训练批次: {len(train_loader)}, 验证批次: {len(val_loader)}, 测试批次: {len(test_loader)}")
 
 # 邻接矩阵和距离矩阵
@@ -121,10 +145,19 @@ print(net)
 # ---------------------- 加载预训练权重（MD模块）----------------------
 print("\n" + "=" * 50)
 print("主训练配置（根据论文Algorithm 1）:")
+print("-" * 50)
+print("论文符号定义与模型映射:")
+print("  - Rec (X_Rec): 最近连续时间，由num_of_hours参数确定")
+print("  - Hour (X_Hour): 小时周期，由num_of_days参数确定（24小时模式）")
+print("  - Day (X_Day): 日周期，由num_of_weeks参数确定（7天模式）")
+print("-" * 50)
 print("  - 训练MAF模块参数: θ_MAF")
 print("  - 训练MGRC模块参数: θ_MGRC")
 print("  - 训练STFormer模块参数: θ_ST")
 print("  - 冻结MD模块参数: θ_MD（来自预训练）")
+print("    - 冻结rec去噪器 (处理 X_Rec)")
+print("    - 冻结hour去噪器 (处理 X_Hour)")
+print("    - 冻结day去噪器 (处理 X_Day)")
 print("=" * 50)
 
 # 查找预训练模型
@@ -171,11 +204,18 @@ if loss_function.lower() == 'masked_mae':
     criterion = masked_mae
 elif loss_function.lower() == 'masked_mse':
     criterion = masked_mse
+elif loss_function.lower() == 'huber_loss':
+    criterion = masked_huber_loss
 else:
     criterion = nn.MSELoss().to(DEVICE)
 
 # ---------------------- 优化器（训练非MD模块） ----------------------
 # 根据论文Algorithm 1，主训练阶段：
+# 论文符号定义：
+# - Rec (X_Rec): 最近连续时间，由num_of_hours确定，由mdaf.rec去噪器处理
+# - Hour (X_Hour): 小时周期，由num_of_days确定，由mdaf.hour去噪器处理
+# - Day (X_Day): 日周期，由num_of_weeks确定，由mdaf.day去噪器处理
+#
 # - 冻结MD模块参数：mdaf.rec.*/mdaf.hour.*/mdaf.day.*
 # - 训练MAF模块参数：mdaf.attn_*/mdaf.fusion.*
 # - 训练MGRC模块参数：mgrc.*
@@ -219,7 +259,7 @@ print(f"  可训练参数总计: {sum(p.numel() for p in trainable_params):,}")
 
 optimizer = optim.Adam(trainable_params, lr=learning_rate, weight_decay=0.01)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer, mode='min', factor=0.5, patience=10, verbose=True
+    optimizer, mode='min', factor=0.5, patience=10
 )
 
 # ---------------------- TensorBoard ----------------------
@@ -254,7 +294,11 @@ for epoch in range(start_epoch, epochs):
     for batch_index, batch_data in enumerate(train_loader):
         # 主训练模式返回4个数据:
         # (x_rec, x_hour, x_day, labels)
-        # 对应论文中的: X_RecN, X_HourN, X_DayN（带噪声）和预测标签 Y
+        # 根据论文符号定义：
+        # - x_rec   = X_Rec  (最近连续时间，num_of_hours步)
+        # - x_hour  = X_Hour (小时周期，num_of_days步，24小时模式)
+        # - x_day   = X_Day  (日周期，num_of_weeks步，7天模式)
+        # - labels  = Y (预测标签)
         if len(batch_data) != 4:
             print(f"警告: 批次数据长度应为4，实际为{len(batch_data)}")
             continue
@@ -272,10 +316,13 @@ for epoch in range(start_epoch, epochs):
         try:
             outputs = net(x_rec, x_hour, x_day)
         except Exception as e:
-            print(f"前向传播错误（批次 {batch_index}): {e}")
-            print(f"  x_rec.shape: {x_rec.shape}")
-            print(f"  x_hour.shape: {x_hour.shape}")
-            print(f"  x_day.shape: {x_day.shape}")
+            import traceback
+            print(f"\n前向传播错误（批次 {batch_index}): {e}")
+            print(f"  x_rec (X_Rec).shape: {x_rec.shape if x_rec is not None else 'None'}")
+            print(f"  x_hour (X_Hour).shape: {x_hour.shape if x_hour is not None else 'None'}")
+            print(f"  x_day (X_Day).shape: {x_day.shape if x_day is not None else 'None'}")
+            print("完整错误堆栈:")
+            traceback.print_exc()
             continue
 
         # 计算损失（使用Huber损失或指定的损失函数）

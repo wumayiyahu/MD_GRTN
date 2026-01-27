@@ -45,81 +45,39 @@ def get_adjacency_matrix(distance_df_filename, num_of_vertices, id_filename=None
     '''
     if 'npy' in distance_df_filename:
         adj_mx = np.load(distance_df_filename)
-        return adj_mx, None
+        return adj_mx, adj_mx  # 如果是npy文件，同时作为邻接矩阵和距离矩阵
     else:
         import csv
 
         A = np.zeros((int(num_of_vertices), int(num_of_vertices)), dtype=np.float32)
         distaneA = np.zeros((int(num_of_vertices), int(num_of_vertices)), dtype=np.float32)
 
-        if id_filename:
-            with open(id_filename, 'r') as f:
-                id_dict = {int(i): idx for idx, i in enumerate(f.read().strip().split('\n'))}
-
-            with open(distance_df_filename, 'r') as f:
-                f.readline()
-                reader = csv.reader(f)
-                for row in reader:
-                    if len(row) != 3:
+        # 通用CSV处理（支持 from,to,cost 格式）
+        with open(distance_df_filename, 'r') as f:
+            f.readline()  # 跳过标题行
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) < 3:
+                    continue
+                # 尝试将列值转换为数字
+                try:
+                    i = int(float(row[0]))  # 处理可能是浮点数或字符串的情况
+                    j = int(float(row[1]))
+                    distance = float(row[2])
+                    
+                    # 检查索引是否有效（严格大于等于0，小于num_of_vertices）
+                    if i < 0 or i >= num_of_vertices or j < 0 or j >= num_of_vertices:
                         continue
-                    i, j, distance = int(row[0]), int(row[1]), float(row[2])
-                    A[id_dict[i], id_dict[j]] = 1
-                    distaneA[id_dict[i], id_dict[j]] = distance
-            return A, distaneA
-        else:
-            with open(distance_df_filename, 'r') as f:
-                f.readline()
-                reader = csv.reader(f)
-                for row in reader:
-                    if len(row) != 3:
-                        continue
-                    i, j, distance = int(row[0]), int(row[1]), float(row[2])
+                    
+                    # 设置邻接矩阵和距离矩阵
                     A[i, j] = 1
+                    A[j, i] = 1  # 无向图
                     distaneA[i, j] = distance
-            return A, distaneA
-
-
-def scaled_Laplacian(W):
-    '''
-    计算缩放拉普拉斯矩阵
-
-    Parameters
-    ----------
-    W: np.ndarray, shape is (N, N), N是节点数量
-
-    Returns
-    ----------
-    scaled_Laplacian: np.ndarray, shape (N, N)
-    '''
-    assert W.shape[0] == W.shape[1]
-
-    D = np.diag(np.sum(W, axis=1))
-    L = D - W
-    lambda_max = eigs(L, k=1, which='LR')[0].real
-
-    return (2 * L) / lambda_max - np.identity(W.shape[0])
-
-
-def cheb_polynomial(L_tilde, K):
-    '''
-    计算Chebyshev多项式
-
-    Parameters
-    ----------
-    L_tilde: 缩放拉普拉斯矩阵, np.ndarray, shape (N, N)
-    K: Chebyshev多项式的最大阶数
-
-    Returns
-    ----------
-    cheb_polynomials: list(np.ndarray), 长度: K, 从T_0到T_{K-1}
-    '''
-    N = L_tilde.shape[0]
-    cheb_polynomials = [np.identity(N), L_tilde.copy()]
-
-    for i in range(2, K):
-        cheb_polynomials.append(2 * L_tilde * cheb_polynomials[i - 1] - cheb_polynomials[i - 2])
-
-    return cheb_polynomials
+                    distaneA[j, i] = distance  # 无向图
+                except (ValueError, IndexError) as e:
+                    continue
+        
+        return A, distaneA
 
 
 def load_md_grtn_data(graph_signal_matrix_filename, num_of_hours, num_of_days, num_of_weeks, num_for_predict, DEVICE, batch_size,
@@ -189,46 +147,58 @@ def load_md_grtn_data(graph_signal_matrix_filename, num_of_hours, num_of_days, n
 
         # 创建预训练数据集
         class MDGRTNPretrainDataset(torch.utils.data.Dataset):
-            def __init__(self, hour_noisy, day_noisy, week_noisy, hour_clean, day_clean, week_clean):
-                self.hour_noisy = hour_noisy  # (B, N, F, T) 带噪声
-                self.day_noisy = day_noisy    # (B, N, F, T)
-                self.week_noisy = week_noisy  # (B, N, F, T)
-                self.hour_clean = hour_clean  # (B, N, F, T) 干净数据
-                self.day_clean = day_clean    # (B, N, F, T)
-                self.week_clean = week_clean  # (B, N, F, T)
-
-            def __len__(self):
-                return len(self.hour_noisy) if self.hour_noisy is not None else 0
+            """
+            根据 Algorithm 1，预训练阶段：
+            - 输入：Noisy traffic flow features [X_Rec, X_Hour, X_Day]
+              其中 X_Rec = 最近连续时间(num_of_hours), X_Hour = 小时周期(num_of_days), X_Day = 日周期(num_of_weeks)
+            - 监督：Noise-free traffic flow features [X̂_Rec, X̂_Hour, X̂_Day] 仅用于计算MSE损失
+            """
+            def __init__(self, rec_noisy, hour_noisy, day_noisy):
+                self.rec_noisy = rec_noisy  # (B, N, F, T) 带噪声 - X_Rec (最近连续时间，num_of_hours)
+                self.hour_noisy = hour_noisy  # (B, N, F, T) - X_Hour (小时周期，num_of_days)
+                self.day_noisy = day_noisy    # (B, N, F, T) - X_Day (日周期，num_of_weeks)
+                self.clean_data = {
+                    'rec': None,  # 干净数据存储在外部，不通过DataLoader传递
+                    'hour': None,
+                    'day': None
+                }
 
             def __getitem__(self, idx):
                 """
-                返回预训练所需的6个数据
+                返回预训练所需的噪声数据作为输入
                 模型期望输入: (N, F, T)，DataLoader会添加batch维度
+                
+                根据 Algorithm 1 第3行：
+                Ĥ_k = BackNet_k(X_k)  // 只使用噪声数据
                 """
                 # 提取第一个特征（流量特征）
-                rec_noisy = self.hour_noisy[idx][:, :, 0:1, :]  # (N, 1, T)
-                hour_noisy = self.day_noisy[idx][:, :, 0:1, :]  # (N, 1, T)
-                day_noisy = self.week_noisy[idx][:, :, 0:1, :]   # (N, 1, T)
+                rec_noisy = self.rec_noisy[idx][:, :, :]  # (N, 1, T) - X_Rec (最近连续时间)
+                hour_noisy = self.hour_noisy[idx][:, :, :]  # (N, 1, T) - X_Hour (小时周期)
+                day_noisy = self.day_noisy[idx][:, :, :]    # (N, 1, T) - X_Day (日周期)
                 
-                rec_clean = self.hour_clean[idx][:, :, 0:1, :]   # (N, 1, T)
-                hour_clean = self.day_clean[idx][:, :, 0:1, :]   # (N, 1, T)
-                day_clean = self.week_clean[idx][:, :, 0:1, :]   # (N, 1, T)
-                
-                return rec_noisy, hour_noisy, day_noisy, rec_clean, hour_clean, day_clean
-
+                return rec_noisy, hour_noisy, day_noisy
+            
+        # 创建预训练集
         train_dataset = MDGRTNPretrainDataset(
-            train_hour_noisy_tensor, train_day_noisy_tensor, train_week_noisy_tensor,
-            train_hour_tensor, train_day_tensor, train_week_tensor
+            train_hour_noisy_tensor,  # X_Rec (num_of_hours步，最近的连续时间)
+            train_day_noisy_tensor,   # X_Hour (num_of_days步，小时周期)
+            train_week_noisy_tensor   # X_Day (num_of_weeks步，日周期)
         )
+        
+        # 存储干净数据作为监督信号（根据 Algorithm 1 第4行：Loss = MSE(Ĥ_k, X̂_k)）
+        train_dataset.clean_data = {
+            'rec': train_hour_tensor,   # X̂_Rec (num_of_hours步，干净数据)
+            'hour': train_day_tensor,   # X̂_Hour (num_of_days步，干净数据)
+            'day': train_week_tensor    # X̂_Day (num_of_weeks步，干净数据)
+        }
 
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle)
 
         return train_loader, None, None, None, None, None, None, None
 
     else:
-        # 主训练/测试：根据论文Algorithm 1，主训练阶段使用带噪声数据作为输入
-        # 训练集：使用带噪声数据作为输入（与预训练一致）
-        # 验证集和测试集：使用干净数据（评估模型在干净输入下的性能）
+        # 主训练/测试：根据论文Algorithm 1，所有阶段都使用带噪声数据作为输入
+        # 论文从头到尾只有一个输入分布：noisy
         
         # 训练集输入：带噪声数据
         train_hour = file_data['train_hour_noisy']
@@ -236,16 +206,16 @@ def load_md_grtn_data(graph_signal_matrix_filename, num_of_hours, num_of_days, n
         train_week = file_data['train_week_noisy'] if 'train_week_noisy' in file_data else None
         train_target = file_data['train_target']
         
-        # 验证集输入：干净数据（不添加噪声）
-        val_hour = file_data['val_hour']
-        val_day = file_data['val_day']
-        val_week = file_data['val_week'] if 'val_week' in file_data else None
+        # 验证集输入：带噪声数据
+        val_hour = file_data['val_hour_noisy'] if 'val_hour_noisy' in file_data else file_data['val_hour']
+        val_day = file_data['val_day_noisy'] if 'val_day_noisy' in file_data else file_data['val_day']
+        val_week = file_data['val_week_noisy'] if 'val_week_noisy' in file_data else (file_data['val_week'] if 'val_week' in file_data else None)
         val_target = file_data['val_target']
         
-        # 测试集输入：干净数据（不添加噪声）
-        test_hour = file_data['test_hour']
-        test_day = file_data['test_day']
-        test_week = file_data['test_week'] if 'test_week' in file_data else None
+        # 测试集输入：带噪声数据
+        test_hour = file_data['test_hour_noisy'] if 'test_hour_noisy' in file_data else file_data['test_hour']
+        test_day = file_data['test_day_noisy'] if 'test_day_noisy' in file_data else file_data['test_day']
+        test_week = file_data['test_week_noisy'] if 'test_week_noisy' in file_data else (file_data['test_week'] if 'test_week' in file_data else None)
         test_target = file_data['test_target']
 
         # 转换为张量
@@ -274,11 +244,18 @@ def load_md_grtn_data(graph_signal_matrix_filename, num_of_hours, num_of_days, n
 
         # 创建主训练数据集
         class MDGRTNTrainDataset(torch.utils.data.Dataset):
-            def __init__(self, hour, day, week, target):
-                self.hour = hour  # 近期序列 (B, N, F, T)
-                self.day = day    # 日周期序列 (B, N, F, T)
-                self.week = week  # 周周期序列 (B, N, F, T)，可能为None
-                self.target = target  # 目标数据 (B, N, T_out)
+            def __init__(self, rec, hour, day, target):
+                """
+                参数:
+                    rec: 近期序列 (B, N, F, T) - X_Rec，由num_of_hours参数确定
+                    hour: 小时周期序列 (B, N, F, T) - X_Hour，由num_of_days参数确定
+                    day: 日周期序列 (B, N, F, T) - X_Day，由num_of_weeks参数确定
+                    target: 目标数据 (B, N, T_out)
+                """
+                self.rec = rec  # X_Rec: 最近连续时间
+                self.hour = hour  # X_Hour: 小时周期(24小时模式)
+                self.day = day  # X_Day: 日周期(7天模式)
+                self.target = target
 
             def __len__(self):
                 return len(self.target)
@@ -287,35 +264,54 @@ def load_md_grtn_data(graph_signal_matrix_filename, num_of_hours, num_of_days, n
                 """
                 返回单个样本的数据
                 模型期望输入: (B, N, F, T)，DataLoader会添加batch维度
+                
+                返回: (x_rec, x_hour, x_day, labels)
+                - x_rec: X_Rec (最近连续时间，num_of_hours步)
+                - x_hour: X_Hour (小时周期，num_of_days步)
+                - x_day: X_Day (日周期，num_of_weeks步)
                 """
-                # 处理可能为None的周数据
-                if self.week is not None:
-                    week_data = self.week[idx]  # (N, F, T)
+                # 处理可能为None的日数据
+                if self.day is not None:
+                    day_data = self.day[idx]  # (N, F, T) - X_Day
                 else:
-                    # 创建零张量，使用hour的形状
-                    week_data = torch.zeros_like(self.hour[idx][:, :, :1])  # 只取1个时间步，避免浪费内存
+                    # 创建零张量，使用rec的形状
+                    day_data = torch.zeros_like(self.rec[idx][:, :, :1])  # 只取1个时间步，避免浪费内存
                 
-                # 移除F维度中多余的特征（只使用第一个特征）
-                # 数据形状从 (N, F, T) 中的 F=1（流量特征）
-                hour_data = self.hour[idx][:, :, 0:1, :]   # (N, 1, T)
-                day_data = self.day[idx][:, :, 0:1, :]      # (N, 1, T)
-                week_data = week_data[:, :, 0:1, :]          # (N, 1, T)
+                # 数据形状已经是 (N, 1, T)，F=1（流量特征）
+                rec_data = self.rec[idx][:, :, :]   # (N, 1, T) - X_Rec
+                hour_data = self.hour[idx][:, :, :]   # (N, 1, T) - X_Hour
+                day_data = day_data[:, :, :]          # (N, 1, T) - X_Day
                 
-                return hour_data, day_data, week_data, self.target[idx]
+                return rec_data, hour_data, day_data, self.target[idx]
 
         # 创建数据加载器
-        train_dataset = MDGRTNTrainDataset(train_hour_tensor, train_day_tensor, train_week_tensor, train_target_tensor)
+        train_dataset = MDGRTNTrainDataset(
+            train_hour_tensor,  # X_Rec (最近连续时间，num_of_hours步)
+            train_day_tensor,   # X_Hour (小时周期，num_of_days步)
+            train_week_tensor,  # X_Day (日周期，num_of_weeks步)
+            train_target_tensor
+        )
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle)
 
-        val_dataset = MDGRTNTrainDataset(val_hour_tensor, val_day_tensor, val_week_tensor, val_target_tensor)
+        val_dataset = MDGRTNTrainDataset(
+            val_hour_tensor,   # X_Rec
+            val_day_tensor,    # X_Hour
+            val_week_tensor,   # X_Day
+            val_target_tensor
+        )
         val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-        test_dataset = MDGRTNTrainDataset(test_hour_tensor, test_day_tensor, test_week_tensor, test_target_tensor)
+        test_dataset = MDGRTNTrainDataset(
+            test_hour_tensor,   # X_Rec
+            test_day_tensor,    # X_Hour
+            test_week_tensor,   # X_Day
+            test_target_tensor
+        )
         test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-        print(f"训练集 - 小时序列(带噪声): {train_hour_tensor.size()}, 目标: {train_target_tensor.size()}")
-        print(f"验证集 - 小时序列(干净): {val_hour_tensor.size()}, 目标: {val_target_tensor.size()}")
-        print(f"测试集 - 小时序列(干净): {test_hour_tensor.size()}, 目标: {test_target_tensor.size()}")
+        print(f"训练集 - X_Rec(num_of_hours): {train_hour_tensor.size()}, X_Hour(num_of_days): {train_day_tensor.size()}, X_Day(num_of_weeks): {train_week_tensor.size() if train_week_tensor is not None else 'None'}, 目标: {train_target_tensor.size()}")
+        print(f"验证集 - X_Rec: {val_hour_tensor.size()}, X_Hour: {val_day_tensor.size()}, X_Day: {val_week_tensor.size() if val_week_tensor is not None else 'None'}, 目标: {val_target_tensor.size()}")
+        print(f"测试集 - X_Rec: {test_hour_tensor.size()}, X_Hour: {test_day_tensor.size()}, X_Day: {test_week_tensor.size() if test_week_tensor is not None else 'None'}, 目标: {test_target_tensor.size()}")
 
         return (train_loader, train_target_tensor,
                 val_loader, val_target_tensor,
@@ -349,16 +345,16 @@ def compute_val_loss_md_grtn(net, val_loader, criterion, masked_flag, missing_va
         tmp = []  # 记录所有batch的loss
 
         for batch_index, batch_data in enumerate(val_loader):
-            # MD-GRTN: batch_data包含三个输入和一个目标 (x_hour, x_day, x_week, labels)
+            # MD-GRTN: batch_data包含三个输入和一个目标 (x_rec, x_hour, x_day, labels)
             if len(batch_data) != 4:
                 print(f"错误: MD-GRTN期望4个数据，但得到{len(batch_data)}个")
                 continue
 
-            x_hour, x_day, x_week, labels = batch_data
+            x_rec, x_hour, x_day, labels = batch_data
 
             # 调用MD-GRTN模型（需要三个输入）
             try:
-                outputs = net(x_hour, x_day, x_week)
+                outputs = net(x_rec, x_hour, x_day)
             except Exception as e:
                 print(f"前向传播错误: {e}")
                 continue
@@ -411,24 +407,24 @@ def predict_and_save_results_md_grtn(net, data_loader, data_target_tensor, globa
         loader_length = len(data_loader)
 
         prediction = []
-        input_hour_list, input_day_list, input_week_list = [], [], []
+        input_rec_list, input_hour_list, input_day_list = [], [], []
 
         for batch_index, batch_data in enumerate(data_loader):
-            # MD-GRTN: batch_data包含三个输入和一个目标
+            # MD-GRTN: batch_data包含三个输入和一个目标 (x_rec, x_hour, x_day, labels)
             if len(batch_data) != 4:
                 print(f"错误: MD-GRTN期望4个数据，但得到{len(batch_data)}个")
                 continue
 
-            x_hour, x_day, x_week, labels = batch_data
+            x_rec, x_hour, x_day, labels = batch_data
 
             # 保存输入数据用于分析
+            input_rec_list.append(x_rec[:, :, 0:1].cpu().numpy())
             input_hour_list.append(x_hour[:, :, 0:1].cpu().numpy())
             input_day_list.append(x_day[:, :, 0:1].cpu().numpy())
-            input_week_list.append(x_week[:, :, 0:1].cpu().numpy())
 
             # 前向传播
             try:
-                outputs = net(x_hour, x_day, x_week)
+                outputs = net(x_rec, x_hour, x_day)
             except Exception as e:
                 print(f"前向传播错误: {e}")
                 continue
@@ -439,21 +435,21 @@ def predict_and_save_results_md_grtn(net, data_loader, data_target_tensor, globa
                 print(f'预测数据集批次 {batch_index + 1} / {loader_length}')
 
         # 合并结果
-        if input_hour_list:
+        if input_rec_list:
+            input_rec = np.concatenate(input_rec_list, 0)
             input_hour = np.concatenate(input_hour_list, 0)
             input_day = np.concatenate(input_day_list, 0)
-            input_week = np.concatenate(input_week_list, 0)
         else:
-            input_hour = input_day = input_week = None
+            input_rec = input_hour = input_day = None
 
         if prediction:
             prediction = np.concatenate(prediction, 0)
         else:
             prediction = None
 
-        print(f'输入小时序列: {input_hour.shape if input_hour is not None else "None"}')
-        print(f'输入日序列: {input_day.shape if input_day is not None else "None"}')
-        print(f'输入周序列: {input_week.shape if input_week is not None else "None"}')
+        print(f'输入X_Rec(num_of_hours): {input_rec.shape if input_rec is not None else "None"}')
+        print(f'输入X_Hour(num_of_days): {input_hour.shape if input_hour is not None else "None"}')
+        print(f'输入X_Day(num_of_weeks): {input_day.shape if input_day is not None else "None"}')
         print(f'预测结果: {prediction.shape if prediction is not None else "None"}')
         print(f'目标数据: {data_target_tensor.shape}')
 
@@ -465,12 +461,12 @@ def predict_and_save_results_md_grtn(net, data_loader, data_target_tensor, globa
             'data_target_tensor': data_target_tensor
         }
 
+        if input_rec is not None:
+            save_dict['input_rec'] = input_rec
         if input_hour is not None:
             save_dict['input_hour'] = input_hour
         if input_day is not None:
             save_dict['input_day'] = input_day
-        if input_week is not None:
-            save_dict['input_week'] = input_week
 
         np.savez(output_filename, **save_dict)
         print(f'结果已保存到: {output_filename}')

@@ -30,13 +30,20 @@ class SinusoidalTimeEmbedding(nn.Module):
 ############################################
 class DiffusionDenoiser(nn.Module):
     """
-    DDPM-based denoiser
-
+    Diffusion denoiser (BackNet_k)
+    
+    论文定义：Ĥ_k = BackNet_k(X_k)
+    
     输入 :
         x0 : (B, N, F, T)
     输出 :
-        x_denoised : (B, N, D, T)
-        diffusion_loss : scalar
+        x_denoised_traffic : (B, N, F, T) - 交通流空间（预训练用）
+        x_denoised_hidden : (B, N, D, T) - 隐藏空间（主训练用）
+    
+    重要修改：
+    - BackNet 直接输出 F 维（交通流空间），实现真实去噪
+    - 添加 F→D 投影层，供主训练阶段使用
+    - 预训练时直接在 traffic 空间计算 MSE，无需 input_projector
     """
 
     def __init__(
@@ -50,6 +57,7 @@ class DiffusionDenoiser(nn.Module):
         super().__init__()
 
         self.D = D
+        self.F_in = F_in
         self.diffusion_steps = diffusion_steps
 
         # -------- β schedule --------
@@ -70,30 +78,37 @@ class DiffusionDenoiser(nn.Module):
         )
 
         # -------- U-Net backbone (1D, time axis) --------
+        # 注意：现在 BackNet 输出 F 维（交通流空间）
         self.enc1 = nn.Conv1d(F_in, D, kernel_size=3, padding=1)
         self.enc2 = nn.Conv1d(D, D, kernel_size=3, padding=1)
 
         self.dec1 = nn.Conv1d(D, D, kernel_size=3, padding=1)
-        self.dec2 = nn.Conv1d(D, D, kernel_size=3, padding=1)
+        self.dec2 = nn.Conv1d(D, F_in, kernel_size=3, padding=1)  # 直接输出 F 维
 
-    def forward(self, x0, use_pure_denoising=True):
+        # -------- F→D 投影层（供主训练使用）--------
+        self.project_to_d = nn.Conv1d(F_in, D, kernel_size=1)  # 1x1 卷积投影
+
+    def forward(self, x0, use_pure_denoising=True, return_traffic_space=True):
         """
-        去噪器前向传播
+        Diffusion denoiser forward pass
         
-        根据论文Algorithm 1，预训练阶段应该是：
-        - 输入：带噪声的数据 X_k (已经是带噪声的）
-        - 输出：去噪后的数据 Ȟ_k ≈ X̂_k (干净数据）
-        - 损失：MSE(Ȟ_k, X̂_k)
+        根据论文Algorithm 1：
+        Ĥ_k = BackNet_k(X_k)
         
         参数:
-            x0: (B,N,F,T) - 输入数据（预训练时已经是带噪声的）
-            use_pure_denoising: bool -
-                True: 纯去噪模式（符合论文），直接学习带噪声→干净
-                False: DDPM标准模式，用于测试
+            x0: (B,N,F,T) - 输入数据（带噪声）
+            use_pure_denoising: bool - 去噪模式选择
+            return_traffic_space: bool - 是否返回交通流空间输出
                 
         返回:
-            x0_hat: (B,N,D,T) - 去噪后的数据
-            loss: scalar - 去噪损失
+            如果 return_traffic_space=True:
+                x0_hat_traffic: (B,N,F,T) - 去噪后的交通流（F维）
+            如果 return_traffic_space=False:
+                x0_hat_hidden: (B,N,D,T) - 去噪后的隐藏特征（D维）
+        
+        重要说明：
+        - 预训练模式：return_traffic_space=True，直接用 F 维输出计算 MSE
+        - 主训练模式：return_traffic_space=False，用投影到 D 维的输出
         """
         B, N, F, T = x0.shape
         x0 = x0.reshape(B * N, F, T)
@@ -103,21 +118,15 @@ class DiffusionDenoiser(nn.Module):
             # 直接将带噪声数据作为输入，通过U-Net学习去噪
             x = x0
             
-            # 不使用时间嵌入（因为输入已经是特定噪声水平的数据）
-            # 使用恒定的"基准"时间步
-            t = torch.ones(B * N, device=x0.device, dtype=torch.long)
-            t_emb = self.time_embed(t)
-            t_emb = self.time_mlp(t_emb).unsqueeze(-1)  # (B*N,D,1)
-            
             # U-Net前向传播
             h1 = F.relu(self.enc1(x))
-            h2 = F.relu(self.enc2(h1 + t_emb))
+            h2 = F.relu(self.enc2(h1))
             
             h3 = F.relu(self.dec1(h2))
-            x0_hat = self.dec2(h3 + h1)  # 直接输出去噪结果
+            x0_hat_traffic = self.dec2(h3 + h1)  # 直接输出 F 维（交通流空间）
             
-            # 损失将在外部通过MSE(x0_hat, clean_data)计算
-            loss = torch.tensor(0.0, device=x0.device, requires_grad=True)
+            # 投影到 D 维（供主训练使用）
+            x0_hat_hidden = self.project_to_d(x0_hat_traffic)
             
         else:
             # DDPM标准模式（用于对比测试）
@@ -140,17 +149,20 @@ class DiffusionDenoiser(nn.Module):
             h3 = F.relu(self.dec1(h2))
             eps_hat = self.dec2(h3 + h1)
             
-            diffusion_loss = F.mse_loss(eps_hat, eps)
+            x0_hat_traffic = (x_t - torch.sqrt(1.0 - alpha_bar_t) * eps_hat) / torch.sqrt(alpha_bar_t)
             
-            x0_hat = (
-                             x_t - torch.sqrt(1.0 - alpha_bar_t) * eps_hat
-                     ) / torch.sqrt(alpha_bar_t)
-            
-            loss = diffusion_loss
+            # 投影到 D 维
+            x0_hat_hidden = self.project_to_d(x0_hat_traffic)
 
-        x0_hat = x0_hat.reshape(B, N, self.D, T)
+        # Reshape
+        x0_hat_traffic = x0_hat_traffic.reshape(B, N, self.F_in, T)
+        x0_hat_hidden = x0_hat_hidden.reshape(B, N, self.D, T)
 
-        return x0_hat, loss
+        # 根据模式返回
+        if return_traffic_space:
+            return x0_hat_traffic
+        else:
+            return x0_hat_hidden
 
 
 ############################################
@@ -158,12 +170,19 @@ class DiffusionDenoiser(nn.Module):
 ############################################
 class MDAF(nn.Module):
     """
+    Multi-period Diffusion Attention Fusion
+    
     输入 :
         X_rec  : (B,N,F,T_rec)  # 近期序列，长度T_rec
         X_hour : (B,N,F,T_hour) # 小时周期序列，长度T_hour
         X_day  : (B,N,F,T_day)  # 日周期序列，长度T_day
     输出 :
         X_mdaf : (B,N,D,T_max)  # T_max = max(T_rec, T_hour, T_day)
+    
+    功能：
+        1. Diffusion denoising (三个 BackNet_k)
+        2. Temporal self-attention (公式 5–8)
+        3. Multi-period fusion (公式 9)
     """
 
     def __init__(self, F_in, D, nhead=1):
@@ -188,7 +207,7 @@ class MDAF(nn.Module):
         # -------- Multi-head Fusion (公式 9) --------
         self.fusion = nn.Linear(3 * D, D)
 
-    def forward(self, x_rec, x_hour, x_day, training_mode=False, use_pure_denoising=True):
+    def forward(self, x_rec, x_hour, x_day, use_pure_denoising=True, return_traffic_space=False):
         """
         MDAF模块前向传播
         
@@ -196,19 +215,19 @@ class MDAF(nn.Module):
             x_rec: (B,N,F,T_rec) - 近期序列
             x_hour: (B,N,F,T_hour) - 小时周期序列
             x_day: (B,N,F,T_day) - 日周期序列
-            training_mode: bool - True:预训练模式(返回损失), False:主训练模式
             use_pure_denoising: bool - 是否使用纯去噪模式（符合论文）
+            return_traffic_space: bool - 是否返回交通流空间输出（用于预训练）
             
         返回:
-            预训练: (x_fused, (loss_r, loss_h, loss_d))
-            主训练: x_fused
+            如果 return_traffic_space=True:
+                (xr, xh, xd): 三个周期的去噪结果 (B,N,F,T_k)
+            如果 return_traffic_space=False:
+                x_fused: (B,N,D,T_max) - 融合后的特征（主训练用）
         """
         # -------- 1. Diffusion denoising --------
-        # 预训练阶段：use_pure_denoising=True，直接学习带噪声→干净
-        # 主训练阶段：MD模块被冻结，去噪方式对训练没有影响
-        xr, loss_r = self.rec(x_rec, use_pure_denoising=use_pure_denoising)  # (B,N,D,T_rec)
-        xh, loss_h = self.hour(x_hour, use_pure_denoising=use_pure_denoising)  # (B,N,D,T_hour)
-        xd, loss_d = self.day(x_day, use_pure_denoising=use_pure_denoising)  # (B,N,D,T_day)
+        xr = self.rec(x_rec, use_pure_denoising=use_pure_denoising, return_traffic_space=return_traffic_space)
+        xh = self.hour(x_hour, use_pure_denoising=use_pure_denoising, return_traffic_space=return_traffic_space)
+        xd = self.day(x_day, use_pure_denoising=use_pure_denoising, return_traffic_space=return_traffic_space)
 
         B, N, D = xr.shape[0], xr.shape[1], xr.shape[2]
         T_rec, T_hour, T_day = xr.shape[-1], xh.shape[-1], xd.shape[-1]
@@ -227,6 +246,10 @@ class MDAF(nn.Module):
         xh = xh.permute(0, 1, 3, 2).reshape(B * N, T_max, D)
         xd = xd.permute(0, 1, 3, 2).reshape(B * N, T_max, D)
 
+        # 如果是预训练模式，直接返回交通流空间的去噪结果
+        if return_traffic_space:
+            return xr, xh, xd
+
         # -------- 4. Temporal self-attention --------
         xr_attn, _ = self.attn_rec(xr, xr, xr)
         xh_attn, _ = self.attn_hour(xh, xh, xh)
@@ -239,16 +262,11 @@ class MDAF(nn.Module):
         # -------- 6. reshape back --------
         x_fused = x_fused.reshape(B, N, T_max, D).permute(0, 1, 3, 2)  # (B,N,D,T_max)
 
-        if training_mode:
-            # 预训练模式：返回融合特征和三个扩散损失
-            return x_fused, (loss_r, loss_h, loss_d)
-        else:
-            # 主训练模式：只返回融合特征
-            return x_fused
+        return x_fused
 
 
 ############################################
-# 3. MGRC: Multi-Graph Recurrent Convolution (修复版)
+# 3. MGRC: Multi-Graph Recurrent Convolution
 ############################################
 class MGRC(nn.Module):
     """
@@ -294,6 +312,9 @@ class MGRC(nn.Module):
         A_concat = A_concat.unsqueeze(0)  # (1,2,N,N)
         A_F = F.relu(self.graph_fusion(A_concat))  # (1,1,N,N)
         A_F = A_F.squeeze(0).squeeze(0)  # (N,N)
+        
+        # 修正：对融合后的邻接矩阵进行softmax归一化，防止数值不稳定
+        A_F = torch.softmax(A_F, dim=-1)
 
         # 图卷积（公式13）
         x = x.permute(0, 3, 1, 2)  # (B,T_H,N,D)
@@ -308,15 +329,20 @@ class MGRC(nn.Module):
         x = torch.stack(gcn_out, dim=1)  # (B,T_H,N,D)
 
         # GRU 建模时间递归（公式14）
-        x = x.reshape(B * T_H, N, D)
+        # 修正：GRU应该对每个节点的时间序列建模，而不是对时间步建模节点
+        # 输入格式：(batch_size, sequence_length, input_size)
+        # 正确的reshape：(B, T_H, N, D) -> (B, N, T_H, D) -> (B*N, T_H, D)
+        x = x.reshape(B, T_H, N, D).permute(0, 2, 1, 3)  # (B,N,T_H,D)
+        x = x.reshape(B * N, T_H, D)  # (B*N, T_H, D) - 每个节点的T_H个时间步
         x, _ = self.gru(x)
-        x = x.reshape(B, T_H, N, D)
+        # reshape回 (B,N,D,T_H)
+        x = x.reshape(B, N, T_H, D).transpose(2, 3)  # (B,N,D,T_H)
 
         return x.permute(0, 2, 3, 1)  # (B,N,D,T_H)
 
 
 ############################################
-# 4. STFormer: Spatial-Temporal Transformer (修复版)
+# 4. STFormer: Spatial-Temporal Transformer 
 ############################################
 class SpatialTransformer(nn.Module):
     """
@@ -433,9 +459,19 @@ class STFormer(nn.Module):
     输出 : (B,N,D,T_H)
     """
 
-    def __init__(self, D, num_heads=3, num_layers=2):
+    def __init__(self, D, num_nodes, num_heads=3, num_layers=2, adj_mx=None):
         super().__init__()
         self.num_layers = num_layers
+        self.num_nodes = num_nodes
+
+        # 注册邻接矩阵作为buffer，确保device管理正确
+        if adj_mx is not None:
+            if isinstance(adj_mx, torch.Tensor):
+                self.register_buffer('A', adj_mx)
+            else:
+                self.register_buffer('A', torch.tensor(adj_mx, dtype=torch.float32))
+        else:
+            self.register_buffer('A', torch.eye(num_nodes))
 
         self.spatial_layers = nn.ModuleList([
             SpatialTransformer(D, num_heads=num_heads)
@@ -468,30 +504,35 @@ class STFormer(nn.Module):
         # 层级处理
         for l in range(self.num_layers):
             # 空间Transformer（处理每个时间步的空间关系）
-            x_spatial_list = []
-            for t in range(T_H):
-                xt = x[:, :, :, t]  # (B,N,D)
-                xt = self.spatial_layers[l](xt, A=None)  # 这里A应该在模型外部传入
-                x_spatial_list.append(xt.unsqueeze(-1))
-            x = torch.cat(x_spatial_list, dim=-1)  # (B,N,D,T_H)
-
+            # 改进：reshape后批量处理，避免Python for循环
+            x_permuted = x.permute(0, 3, 1, 2)  # (B,T_H,N,D)
+            x_reshaped = x_permuted.reshape(B * T_H, N, D)  # (B*T_H,N,D)
+            
+            # 传入register_buffer的A矩阵，确保device一致
+            x_spatial = self.spatial_layers[l](x_reshaped, A=self.A)  # (B*T_H,N,D)
+            
+            x_spatial = x_spatial.reshape(B, T_H, N, D).permute(0, 2, 3, 1)  # (B,N,D,T_H)
+            
             # 时间Transformer（处理每个节点的时间关系）
-            x = x.permute(0, 2, 3, 1)  # (B,D,T_H,N)
-            x_temporal_list = []
-            for n in range(N):
-                xn = x[:, :, :, n]  # (B,D,T_H)
-                xn = xn.permute(0, 2, 1)  # (B,T_H,D)
-                xn = self.temporal_layers[l](xn, hour_idx, day_idx, week_idx)
-                x_temporal_list.append(xn.permute(0, 2, 1).unsqueeze(-1))
-            x = torch.cat(x_temporal_list, dim=-1)  # (B,D,T_H,N)
-
-            x = x.permute(0, 3, 1, 2)  # (B,N,D,T_H)
+            # 改进：reshape后批量处理，避免Python for循环
+            x_permuted2 = x_spatial.permute(0, 1, 3, 2)  # (B,N,T_H,D)
+            x_reshaped2 = x_permuted2.reshape(B * N, T_H, D)  # (B*N,T_H,D)
+            
+            # 时间索引需要广播到(B*N, T_H)
+            hour_idx_broadcast = hour_idx.unsqueeze(1).expand(-1, N, -1).reshape(B * N, T_H)
+            day_idx_broadcast = day_idx.unsqueeze(1).expand(-1, N, -1).reshape(B * N, T_H)
+            week_idx_broadcast = week_idx.unsqueeze(1).expand(-1, N, -1).reshape(B * N, T_H)
+            
+            x_temporal = self.temporal_layers[l](x_reshaped2, hour_idx_broadcast, day_idx_broadcast, week_idx_broadcast)  # (B*N,T_H,D)
+            
+            x_temporal = x_temporal.reshape(B, N, T_H, D).permute(0, 1, 3, 2)  # (B,N,D,T_H)
+            x = x_temporal
 
         return x
 
 
 ############################################
-# 5. MD-GRTN 主模型（修复版）
+# 5. MD-GRTN 主模型
 ############################################
 class MD_GRTN(nn.Module):
     """
@@ -532,7 +573,8 @@ class MD_GRTN(nn.Module):
         self.mgrc = MGRC(num_nodes, D, adj_mx, distance_mx, DEVICE)
 
         # STFormer模块：时空Transformer
-        self.stformer = STFormer(D, num_heads=3, num_layers=2)
+        # 传入num_nodes和adj_mx，确保A矩阵正确注册和device管理
+        self.stformer = STFormer(D, num_nodes=num_nodes, num_heads=3, num_layers=2, adj_mx=adj_mx)
 
         # 最终预测层（公式26）
         self.predictor = nn.Sequential(
@@ -547,7 +589,7 @@ class MD_GRTN(nn.Module):
         B = x_rec.shape[0]
 
         # MDAF模块：多周期扩散注意力融合
-        x = self.mdaf(x_rec, x_hour, x_day, training_mode=False)  # (B,N,D,T_max)
+        x = self.mdaf(x_rec, x_hour, x_day)  # (B,N,D,T_max)
 
         # MGRC模块：多图循环卷积
         x = self.mgrc(x)  # (B,N,D,T_max)
@@ -569,7 +611,7 @@ class MD_GRTN(nn.Module):
 
 
 ############################################
-# 6. make_model（保持与 ASTGCN 一致）
+# 6. make_model
 ############################################
 def make_model(
         DEVICE,
@@ -610,44 +652,3 @@ def make_model(
 
     return model
 
-
-############################################
-# 7. 预训练辅助函数
-############################################
-def pretrain_mdaf_module(model, hour_noisy, day_noisy, week_noisy, hour_clean, day_clean, week_clean):
-    """
-    预训练MDAF模块的辅助函数
-
-    参数:
-        model: MD_GRTN模型
-        hour_noisy: (B,N,F,T_H) 带噪声的小时序列
-        day_noisy: (B,N,F,T_H)  带噪声的日序列
-        week_noisy: (B,N,F,T_H) 带噪声的周序列
-        hour_clean: (B,N,F,T_H) 干净的小时序列
-        day_clean: (B,N,F,T_H)  干净的日序列
-        week_clean: (B,N,F,T_H) 干净的周序列
-
-    返回:
-        total_loss: 总扩散损失
-        fused_features: 融合后的特征 (B,N,D,T_max)
-    """
-    # 调用MDAF模块的训练模式
-    fused_features, (loss_hour, loss_day, loss_week) = model.mdaf(
-        hour_noisy, day_noisy, week_noisy, training_mode=True
-    )
-
-    total_loss = loss_hour + loss_day + loss_week
-
-    # 可选：计算重构损失（与干净数据比较）
-    with torch.no_grad():
-        # 分别对干净数据进行去噪
-        hour_denoised, _ = model.mdaf.rec(hour_clean)
-        day_denoised, _ = model.mdaf.hour(day_clean)
-        week_denoised, _ = model.mdaf.day(week_clean)
-
-        # 计算重构误差
-        recon_loss = F.mse_loss(hour_denoised, hour_clean) + \
-                     F.mse_loss(day_denoised, day_clean) + \
-                     F.mse_loss(week_denoised, week_clean)
-
-    return total_loss, fused_features, recon_loss

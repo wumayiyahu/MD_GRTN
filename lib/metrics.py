@@ -54,6 +54,51 @@ def masked_mae(preds, labels, null_val=np.nan):
     return torch.mean(loss)
 
 
+def masked_mape(preds, labels, null_val=np.nan):
+    if np.isnan(null_val):
+        mask = ~torch.isnan(labels)
+    else:
+        mask = (labels != null_val)
+    mask = mask.float()
+    mask /= torch.mean((mask))
+    mask = torch.where(torch.isnan(mask), torch.zeros_like(mask), mask)
+    mape = torch.abs((preds - labels) / labels)
+    mape = torch.where(torch.isnan(mape), torch.zeros_like(mape), mape)
+    mape = torch.where(torch.isinf(mape), torch.zeros_like(mape), mape)
+    mape = mape * mask
+    return torch.mean(mape)
+
+
+def masked_huber_loss(preds, labels, null_val=np.nan, delta=1.0):
+    """
+    Huber Loss with masking support (论文公式27)
+    Args:
+        preds: 预测值
+        labels: 真实值
+        null_val: 缺失值标记
+        delta: Huber loss的阈值参数
+    """
+    if np.isnan(null_val):
+        mask = ~torch.isnan(labels)
+    else:
+        mask = (labels != null_val)
+    mask = mask.float()
+    mask /= torch.mean((mask))
+    mask = torch.where(torch.isnan(mask), torch.zeros_like(mask), mask)
+    
+    # Huber Loss 实现
+    error = preds - labels
+    abs_error = torch.abs(error)
+    
+    # 当误差小于delta时，使用平方损失；否则使用线性损失
+    quadratic = torch.min(abs_error, torch.ones_like(abs_error) * delta)
+    linear = abs_error - quadratic
+    
+    loss = 0.5 * quadratic ** 2 + delta * linear
+    loss = loss * mask
+    loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
+    return torch.mean(loss)
+
 
 def masked_mae_test(y_true, y_pred, null_val=np.nan):
     with np.errstate(divide='ignore', invalid='ignore'):

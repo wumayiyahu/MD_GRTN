@@ -35,6 +35,16 @@ def get_sample_indices(data_sequence, num_of_weeks, num_of_days, num_of_hours,
                        label_start_idx, num_for_predict, points_per_hour=12):
     '''
     获取单个样本的多周期数据
+    
+    参数说明：
+    - num_of_weeks: 论文中的 Day 周期数（日周期，7天模式）
+    - num_of_days: 论文中的 Hour 周期数（小时周期，24小时模式）
+    - num_of_hours: 论文中的 Rec 周期数（最近连续时间）
+    
+    返回：
+    - week_sample: Day周期数据（7天前的数据）
+    - day_sample: Hour周期数据（24小时前的数据）
+    - hour_sample: Rec周期数据（最近连续时间）
     '''
     week_sample, day_sample, hour_sample = None, None, None
 
@@ -42,12 +52,12 @@ def get_sample_indices(data_sequence, num_of_weeks, num_of_days, num_of_hours,
         return week_sample, day_sample, hour_sample, None
 
     if num_of_weeks > 0:
-        week_indices = search_data(data_sequence.shape[0], num_of_weeks,
+        week_indices = search_data(data_sequence.shape[0], num_of_weeks, #搜索周期数据索引
                                    label_start_idx, num_for_predict,
                                    7 * 24, points_per_hour)
         if not week_indices:
             return None, None, None, None
-        week_sample = np.concatenate([data_sequence[i: j]
+        week_sample = np.concatenate([data_sequence[i: j]  #提取周期数据特征
                                       for i, j in week_indices], axis=0)
 
     if num_of_days > 0:
@@ -216,7 +226,7 @@ def prepare_md_grtn_dataset(original_data_path,
     print(f"噪声配置: {noise_config}")
     print("-" * 60)
     
-    # 1. 加载原始数据（假设已经是修复和插值后的"干净"数据）
+    # 1. 加载原始数据（已经是修复和插值后的"干净"数据）
     print("1. 加载原始数据...")
     data_seq = np.load(original_data_path)['data']  # (T, N, F)
     print(f"   数据形状: {data_seq.shape}")
@@ -239,18 +249,22 @@ def prepare_md_grtn_dataset(original_data_path,
         week_sample, day_sample, hour_sample, target = sample
         
         # 转换为 (N, F, T) 格式并存储
+        # 注意：根据论文符号定义，这里的命名对应关系是：
+        # - week_sample 实际对应 Day 周期(7天周期)
+        # - day_sample 实际对应 Hour 周期(24小时周期)
+        # - hour_sample 实际对应 Rec 周期(最近连续时间)
         sample_data = []
         
         if week_sample is not None:
-            week_sample = week_sample.transpose((1, 2, 0))  # (N, F, T)
+            week_sample = week_sample.transpose((1, 2, 0))  # (N, F, T) - 论文中的 Day 周期
             sample_data.append(('week', week_sample))
         
         if day_sample is not None:
-            day_sample = day_sample.transpose((1, 2, 0))  # (N, F, T)
+            day_sample = day_sample.transpose((1, 2, 0))  # (N, F, T) - 论文中的 Hour 周期
             sample_data.append(('day', day_sample))
             
         if hour_sample is not None:
-            hour_sample = hour_sample.transpose((1, 2, 0))  # (N, F, T)
+            hour_sample = hour_sample.transpose((1, 2, 0))  # (N, F, T) - 论文中的 Rec 周期
             sample_data.append(('hour', hour_sample))
             
         target = target.transpose((1, 2, 0))[:, :, :]  # (N, F, T)
@@ -273,27 +287,30 @@ def prepare_md_grtn_dataset(original_data_path,
     
     for sample_data in all_samples:
         for data_type, data in sample_data:
+            # 注意：data_type 名称保持为内部标识符，但实际对应关系：
+            # 保存到文件时，将按论文符号重新命名
             if data_type == 'week' and week_samples is not None:
-                week_samples.append(data)
+                week_samples.append(data)  # 这是 Day 周期数据(7天)
             elif data_type == 'day' and day_samples is not None:
-                day_samples.append(data)
+                day_samples.append(data)  # 这是 Hour 周期数据(24小时)
             elif data_type == 'hour' and hour_samples is not None:
-                hour_samples.append(data)
+                hour_samples.append(data)  # 这是 Rec 周期数据(最近连续)
             elif data_type == 'target':
                 targets.append(data[:, 0, :])  # 只取第一个特征（流量）(N, T)
             elif data_type == 'timestamp':
                 timestamps.append(data)
     
     # 转换为数组并调整维度
+    # 重要：这里的数据将在保存时按照论文符号重新命名
     if week_samples is not None:
-        week_data = np.array(week_samples)  # (B, N, F, T)
+        week_data = np.array(week_samples)  # (B, N, F, T) - 将被保存为 X_Day(7天周期)
         # 为了一致性，我们只使用第一个特征
         week_data = week_data[:, :, 0:1, :]  # (B, N, 1, T)
     else:
         week_data = None
         
     if day_samples is not None:
-        day_data = np.array(day_samples)
+        day_data = np.array(day_samples)  # 将被保存为 X_Hour(24小时周期)
         day_data = day_data[:, :, 0:1, :]
     else:
         day_data = None
@@ -359,47 +376,93 @@ def prepare_md_grtn_dataset(original_data_path,
         )
         print(f"   小时周期归一化完成")
     
-    # 6. 生成噪声版本（用于预训练）
+    # 6. 生成噪声版本（用于训练/验证/测试）
+    # MD-GRTN的核心思想：模型在带噪声的输入上进行鲁棒预测
+    # 输入：Noisy traffic flow (训练/验证/测试均使用噪声数据)
+    # 目标：Clean traffic flow (用于计算预测误差)
     print("6. 生成噪声数据（模拟真实传感器噪声）...")
+    print("   说明：MD-GRTN 在带噪声数据上训练以实现 Noise-robust prediction")
+    print("   - 训练集输入：带噪声数据")
+    print("   - 验证集输入：带噪声数据")
+    print("   - 测试集输入：带噪声数据")
+    print("   - 预测目标：干净数据（用于评估预测准确度）")
+    print("-" * 60)
     
+    # 训练集噪声数据
     train_week_noisy, train_day_noisy, train_hour_noisy = None, None, None
     
     if train_week_norm is not None:
         train_week_noisy = add_comprehensive_traffic_noise(train_week_norm, noise_config)
-        print(f"   周周期噪声数据生成完成")
+        print(f"   训练集周周期噪声数据生成完成")
         
     if train_day_norm is not None:
         train_day_noisy = add_comprehensive_traffic_noise(train_day_norm, noise_config)
-        print(f"   日周期噪声数据生成完成")
+        print(f"   训练集日周期噪声数据生成完成")
         
     if train_hour_norm is not None:
         train_hour_noisy = add_comprehensive_traffic_noise(train_hour_norm, noise_config)
-        print(f"   小时周期噪声数据生成完成")
+        print(f"   训练集小时周期噪声数据生成完成")
+    
+    # 验证集噪声数据
+    val_week_noisy, val_day_noisy, val_hour_noisy = None, None, None
+    
+    if val_week_norm is not None:
+        val_week_noisy = add_comprehensive_traffic_noise(val_week_norm, noise_config)
+        print(f"   验证集周周期噪声数据生成完成")
+        
+    if val_day_norm is not None:
+        val_day_noisy = add_comprehensive_traffic_noise(val_day_norm, noise_config)
+        print(f"   验证集日周期噪声数据生成完成")
+        
+    if val_hour_norm is not None:
+        val_hour_noisy = add_comprehensive_traffic_noise(val_hour_norm, noise_config)
+        print(f"   验证集小时周期噪声数据生成完成")
+    
+    # 测试集噪声数据
+    test_week_noisy, test_day_noisy, test_hour_noisy = None, None, None
+    
+    if test_week_norm is not None:
+        test_week_noisy = add_comprehensive_traffic_noise(test_week_norm, noise_config)
+        print(f"   测试集周周期噪声数据生成完成")
+        
+    if test_day_norm is not None:
+        test_day_noisy = add_comprehensive_traffic_noise(test_day_norm, noise_config)
+        print(f"   测试集日周期噪声数据生成完成")
+        
+    if test_hour_norm is not None:
+        test_hour_noisy = add_comprehensive_traffic_noise(test_hour_norm, noise_config)
+        print(f"   测试集小时周期噪声数据生成完成")
     
     # 7. 准备返回的数据字典
     dataset_dict = {
         'train': {
-            'week': train_week_norm,
+            'week': train_week_norm,           # 干净数据（归一化后）
             'day': train_day_norm,
             'hour': train_hour_norm,
-            'week_noisy': train_week_noisy,
+            'week_noisy': train_week_noisy,     # 带噪声数据（模型输入）
             'day_noisy': train_day_noisy,
             'hour_noisy': train_hour_noisy,
-            'target': train_target,
+            'target': train_target,             # 预测目标（干净流量）
             'timestamp': train_timestamp,
         },
         'val': {
-            'week': val_week_norm,
+            'week': val_week_norm,              # 干净数据（归一化后）
             'day': val_day_norm,
             'hour': val_hour_norm,
-            'target': val_target,
+            'week_noisy': val_week_noisy,       # 带噪声数据（模型输入）
+            'day_noisy': val_day_noisy,
+            'hour_noisy': val_hour_noisy,
+            'target': val_target,               # 预测目标（干净流量）
             'timestamp': val_timestamp,
         },
         'test': {
-            'week': test_week_norm,
+            'week': test_week_norm,             # 干净数据（归一化后）
             'day': test_day_norm,
             'hour': test_hour_norm,
-            'target': test_target,
+            'week_noisy': test_week_noisy,      # 带噪声数据（模型输入）
+            'day_noisy': test_day_noisy,
+            'hour_noisy': test_hour_noisy,
+            'target': test_target,              # 预测目标（干净流量）
             'timestamp': test_timestamp,
         },
         'stats': {
@@ -456,23 +519,29 @@ def prepare_md_grtn_dataset(original_data_path,
                 'hour_std': hour_stats['std'] if hour_stats else 1,
             })
         
-        # 添加验证和测试数据
+        # 添加验证和测试数据（MD-GRTN：输入使用噪声数据）
         if val_week_norm is not None:
             save_dict.update({
-                'val_week': val_week_norm,
+                'val_week': val_week_norm,           # 干净数据（归一化）
+                'val_week_noisy': val_week_noisy,     # 带噪声数据（模型输入）
                 'test_week': test_week_norm,
+                'test_week_noisy': test_week_noisy,   # 带噪声数据（模型输入）
             })
             
         if val_day_norm is not None:
             save_dict.update({
-                'val_day': val_day_norm,
+                'val_day': val_day_norm,             # 干净数据（归一化）
+                'val_day_noisy': val_day_noisy,       # 带噪声数据（模型输入）
                 'test_day': test_day_norm,
+                'test_day_noisy': test_day_noisy,     # 带噪声数据（模型输入）
             })
             
         if val_hour_norm is not None:
             save_dict.update({
-                'val_hour': val_hour_norm,
+                'val_hour': val_hour_norm,           # 干净数据（归一化）
+                'val_hour_noisy': val_hour_noisy,     # 带噪声数据（模型输入）
                 'test_hour': test_hour_norm,
+                'test_hour_noisy': test_hour_noisy,   # 带噪声数据（模型输入）
             })
         
         # 添加目标数据和时间戳
