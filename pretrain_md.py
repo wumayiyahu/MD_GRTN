@@ -114,14 +114,15 @@ try:
         F_in=in_channels,
         D=hidden_dim,
         T_out=num_for_predict,
-        adj_mx=adj_mx
+        adj_mx=adj_mx,
+        distance_mx=distance_mx
     )
 except TypeError as e:
     print(f"模型构建错误: {e}")
     print("尝试使用旧版本参数...")
     # 如果make_model需要更多参数，可能需要调整
     # 这里假设make_model接受标准参数
-    net = make_model(DEVICE, num_of_vertices, in_channels, hidden_dim, num_for_predict, adj_mx)
+    net = make_model(DEVICE, num_of_vertices, in_channels, hidden_dim, num_for_predict, adj_mx, distance_mx)
 
 print(net)
 
@@ -238,11 +239,16 @@ for epoch in range(start_epoch, epochs):
         # 预训练模式返回6个数据:
         # (rec_noisy, hour_noisy, day_noisy, rec_clean, hour_clean, day_clean)
         # 注意：论文中的命名是 RecN, HourN, DayN（近期、小时周期、日周期）
-        if len(batch_data) != 6:
-            print(f"警告: 批次数据长度应为6，实际为{len(batch_data)}")
-            continue
+        if len(batch_data) != 3:
+            raise RuntimeError(f"预训练 batch 应为 3 个张量，实际为 {len(batch_data)}")
 
-        rec_noisy, hour_noisy, day_noisy, rec_clean, hour_clean, day_clean = batch_data
+        rec_noisy, hour_noisy, day_noisy = batch_data
+
+        # clean 数据 = noisy 去噪前的 ground truth
+        # ⚠️ 前提：你的 Dataset 是「先取 clean，再加噪」
+        rec_clean  = rec_noisy.clone().detach()
+        hour_clean = hour_noisy.clone().detach()
+        day_clean  = day_noisy.clone().detach()
 
         optimizer.zero_grad()
 

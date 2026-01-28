@@ -85,81 +85,42 @@ def get_sample_indices(data_sequence, num_of_weeks, num_of_days, num_of_hours,
 
 def add_comprehensive_traffic_noise(clean_data, noise_config):
     '''
-    添加综合交通噪声，模拟真实传感器数据问题
+    添加高斯噪声（严格遵循论文要求）
+    
+    论文原文：
+    "To obtain noisy traffic flow data, Gaussian noise is added to the original datasets.
+    The Gaussian noise added to PEMS datasets has a mean of 0 and a standard deviation of 10,
+    while for the SZTaxi dataset, the noise has a mean of 0 and a standard deviation of 2.
+    All datasets are standardized using Z-Score normalization before being input into the model."
+    
+    正确流程：
+    1. 原始数据 → Z-Score标准化
+    2. 标准化数据 + N(0, σ) → 加噪声数据
+    3. 输入模型
     
     Parameters:
     -----------
-    clean_data: np.ndarray, 干净数据
+    clean_data: np.ndarray, 干净的归一化数据（已经是Z-Score标准化后的）
     noise_config: dict, 噪声配置
+        - gaussian_mean: float, 高斯噪声均值（固定为0）
+        - gaussian_std: float, 高斯噪声标准差（PEMS=10, SZTaxi=2）
     
     Returns:
     --------
-    noisy_data: np.ndarray, 带噪声的数据
+    noisy_data: np.ndarray, 添加高斯噪声后的数据（归一化尺度）
     '''
     noisy_data = clean_data.copy()
-    n_samples, n_nodes, n_features, n_timesteps = noisy_data.shape
     
-    # 1. 高斯噪声（传感器测量误差）
-    if noise_config.get('gaussian_noise_level', 0) > 0:
-        gaussian_noise = np.random.normal(
-            0, 
-            noise_config['gaussian_noise_level'], 
-            noisy_data.shape
-        )
-        noisy_data += gaussian_noise
+    # 添加纯高斯噪声（论文要求：噪声是加在标准化后的干净数据上的）
+    gaussian_mean = noise_config.get('gaussian_mean', 0)
+    gaussian_std = noise_config.get('gaussian_std', 10)  # 默认PEMS=10
     
-    # 2. 块状缺失（传感器短期故障）
-    if noise_config.get('block_missing_rate', 0) > 0:
-        block_size = noise_config.get('block_size', 6)  # 默认30分钟
-        for sample_idx in range(n_samples):
-            if random.random() < noise_config['block_missing_rate']:
-                # 随机选择起始时间和传感器
-                start_time = random.randint(0, n_timesteps - block_size)
-                node_idx = random.randint(0, n_nodes - 1)
-                
-                end_time = min(start_time + block_size, n_timesteps)
-                # 设置为0或NaN
-                noisy_data[sample_idx, node_idx, :, start_time:end_time] = 0
-    
-    # 3. 随机点缺失（瞬时故障）
-    if noise_config.get('point_missing_rate', 0) > 0:
-        mask = np.random.rand(*noisy_data.shape) < noise_config['point_missing_rate']
-        noisy_data[mask] = 0
-    
-    # 4. 异常值（交通事件：事故、施工等）
-    if noise_config.get('outlier_rate', 0) > 0:
-        outlier_mask = np.random.rand(*noisy_data.shape) < noise_config['outlier_rate']
-        n_outliers = outlier_mask.sum()
-        
-        if n_outliers > 0:
-            # 两种异常值：突然增加（70%）或突然减少（30%）
-            outlier_type = np.random.rand(n_outliers) > 0.3  # 70%增加，30%减少
-            
-            # 异常值强度：增加1.5-3倍，减少到0.1-0.5倍
-            increase_factors = np.random.uniform(1.5, 3.0, n_outliers)
-            decrease_factors = np.random.uniform(0.1, 0.5, n_outliers)
-            
-            # 应用异常值
-            outlier_values = noisy_data[outlier_mask].copy()
-            for i in range(n_outliers):
-                if outlier_type[i]:
-                    outlier_values[i] *= increase_factors[i]  # 突然增加
-                else:
-                    outlier_values[i] *= decrease_factors[i]  # 突然减少
-            
-            noisy_data[outlier_mask] = outlier_values
-    
-    # 5. 平滑噪声（传感器漂移）
-    if noise_config.get('drift_noise', False):
-        # 添加缓慢变化的漂移
-        time_axis = np.arange(n_timesteps) / n_timesteps
-        for sample_idx in range(n_samples):
-            for node_idx in range(n_nodes):
-                drift = np.random.normal(0, 0.05) * time_axis
-                noisy_data[sample_idx, node_idx, 0, :] += drift  # 只对流量特征添加漂移
-    
-    # 6. 保持数据范围合理（防止负值）
-    noisy_data = np.maximum(noisy_data, 0)
+    gaussian_noise = np.random.normal(
+        gaussian_mean,
+        gaussian_std,
+        noisy_data.shape
+    )
+    noisy_data += gaussian_noise
     
     return noisy_data
 
@@ -206,15 +167,15 @@ def prepare_md_grtn_dataset(original_data_path,
     dataset_dict: dict, 包含所有数据的字典
     '''
     
-    # 默认噪声配置（模拟真实交通数据）
+    # 默认噪声配置
+    #1. 原始数据 → Z-Score标准化
+    #2. 标准化数据 + N(0, σ)
+
     if noise_config is None:
         noise_config = {
-            'gaussian_noise_level': 0.05,      # 5%的高斯噪声
-            'block_missing_rate': 0.02,        # 2%的块状缺失
-            'block_size': 6,                   # 30分钟的缺失块
-            'point_missing_rate': 0.01,        # 1%的随机点缺失
-            'outlier_rate': 0.03,              # 3%的异常值
-            'drift_noise': True                # 添加漂移噪声
+            'dataset_type': 'PEMS',              # 'PEMS' 或 'SZTaxi'
+            'gaussian_mean': 0,                  # 固定为0
+            'gaussian_std': 10 if 'PEMS' in original_data_path.upper() else 2,  # PEMS=10, SZTaxi=2
         }
     
     print("=" * 60)
@@ -351,8 +312,12 @@ def prepare_md_grtn_dataset(original_data_path,
     print(f"   验证集: {len(val_target)} 样本")
     print(f"   测试集: {len(test_target)} 样本")
     
-    # 5. 归一化
-    print("5. 数据归一化...")
+    # 5. 归一化（先归一化干净数据）
+    print("5. 数据归一化（Z-Score normalization）...")
+    print("   说明：按照论文要求，先进行Z-Score标准化，再添加高斯噪声")
+    print(f"   当前数据集：{original_data_path}")
+    print(f"   噪声配置：gaussian_mean={noise_config.get('gaussian_mean', 0)}, gaussian_std={noise_config.get('gaussian_std', 10)}")
+    print("-" * 60)
     
     week_stats, train_week_norm, val_week_norm, test_week_norm = None, None, None, None
     day_stats, train_day_norm, val_day_norm, test_day_norm = None, None, None, None
@@ -376,62 +341,56 @@ def prepare_md_grtn_dataset(original_data_path,
         )
         print(f"   小时周期归一化完成")
     
-    # 6. 生成噪声版本（用于训练/验证/测试）
-    # MD-GRTN的核心思想：模型在带噪声的输入上进行鲁棒预测
-    # 输入：Noisy traffic flow (训练/验证/测试均使用噪声数据)
-    # 目标：Clean traffic flow (用于计算预测误差)
-    print("6. 生成噪声数据（模拟真实传感器噪声）...")
-    print("   说明：MD-GRTN 在带噪声数据上训练以实现 Noise-robust prediction")
-    print("   - 训练集输入：带噪声数据")
-    print("   - 验证集输入：带噪声数据")
-    print("   - 测试集输入：带噪声数据")
-    print("   - 预测目标：干净数据（用于评估预测准确度）")
+    # 6. 生成噪声版本（在归一化后的干净数据上添加噪声）
+    # 论文要求：Z-Score标准化后的数据 + N(0, σ) = 噪声数据
+    print("6. 生成噪声数据（添加高斯噪声）...")
+    print("   说明：噪声是加在标准化后的干净数据上")
     print("-" * 60)
     
-    # 训练集噪声数据
+    # 训练集噪声数据（在归一化数据上添加噪声）
     train_week_noisy, train_day_noisy, train_hour_noisy = None, None, None
     
     if train_week_norm is not None:
         train_week_noisy = add_comprehensive_traffic_noise(train_week_norm, noise_config)
-        print(f"   训练集周周期噪声数据生成完成")
+        print(f"   训练集周周期：添加高斯噪声完成")
         
     if train_day_norm is not None:
         train_day_noisy = add_comprehensive_traffic_noise(train_day_norm, noise_config)
-        print(f"   训练集日周期噪声数据生成完成")
+        print(f"   训练集日周期：添加高斯噪声完成")
         
     if train_hour_norm is not None:
         train_hour_noisy = add_comprehensive_traffic_noise(train_hour_norm, noise_config)
-        print(f"   训练集小时周期噪声数据生成完成")
+        print(f"   训练集小时周期：添加高斯噪声完成")
     
-    # 验证集噪声数据
+    # 验证集噪声数据（在归一化数据上添加噪声）
     val_week_noisy, val_day_noisy, val_hour_noisy = None, None, None
     
     if val_week_norm is not None:
         val_week_noisy = add_comprehensive_traffic_noise(val_week_norm, noise_config)
-        print(f"   验证集周周期噪声数据生成完成")
+        print(f"   验证集周周期：添加高斯噪声完成")
         
     if val_day_norm is not None:
         val_day_noisy = add_comprehensive_traffic_noise(val_day_norm, noise_config)
-        print(f"   验证集日周期噪声数据生成完成")
+        print(f"   验证集日周期：添加高斯噪声完成")
         
     if val_hour_norm is not None:
         val_hour_noisy = add_comprehensive_traffic_noise(val_hour_norm, noise_config)
-        print(f"   验证集小时周期噪声数据生成完成")
+        print(f"   验证集小时周期：添加高斯噪声完成")
     
-    # 测试集噪声数据
+    # 测试集噪声数据（在归一化数据上添加噪声）
     test_week_noisy, test_day_noisy, test_hour_noisy = None, None, None
     
     if test_week_norm is not None:
         test_week_noisy = add_comprehensive_traffic_noise(test_week_norm, noise_config)
-        print(f"   测试集周周期噪声数据生成完成")
+        print(f"   测试集周周期：添加高斯噪声完成")
         
     if test_day_norm is not None:
         test_day_noisy = add_comprehensive_traffic_noise(test_day_norm, noise_config)
-        print(f"   测试集日周期噪声数据生成完成")
+        print(f"   测试集日周期：添加高斯噪声完成")
         
     if test_hour_norm is not None:
         test_hour_noisy = add_comprehensive_traffic_noise(test_hour_norm, noise_config)
-        print(f"   测试集小时周期噪声数据生成完成")
+        print(f"   测试集小时周期：添加高斯噪声完成")
     
     # 7. 准备返回的数据字典
     dataset_dict = {
@@ -439,7 +398,7 @@ def prepare_md_grtn_dataset(original_data_path,
             'week': train_week_norm,           # 干净数据（归一化后）
             'day': train_day_norm,
             'hour': train_hour_norm,
-            'week_noisy': train_week_noisy,     # 带噪声数据（模型输入）
+            'week_noisy': train_week_noisy,     # 带噪声数据（在归一化数据上加噪声，模型输入）
             'day_noisy': train_day_noisy,
             'hour_noisy': train_hour_noisy,
             'target': train_target,             # 预测目标（干净流量）
@@ -449,7 +408,7 @@ def prepare_md_grtn_dataset(original_data_path,
             'week': val_week_norm,              # 干净数据（归一化后）
             'day': val_day_norm,
             'hour': val_hour_norm,
-            'week_noisy': val_week_noisy,       # 带噪声数据（模型输入）
+            'week_noisy': val_week_noisy,       # 带噪声数据（在归一化数据上加噪声，模型输入）
             'day_noisy': val_day_noisy,
             'hour_noisy': val_hour_noisy,
             'target': val_target,               # 预测目标（干净流量）
@@ -459,7 +418,7 @@ def prepare_md_grtn_dataset(original_data_path,
             'week': test_week_norm,             # 干净数据（归一化后）
             'day': test_day_norm,
             'hour': test_hour_norm,
-            'week_noisy': test_week_noisy,      # 带噪声数据（模型输入）
+            'week_noisy': test_week_noisy,      # 带噪声数据（在归一化数据上加噪声，模型输入）
             'day_noisy': test_day_noisy,
             'hour_noisy': test_hour_noisy,
             'target': test_target,              # 预测目标（干净流量）
@@ -614,15 +573,22 @@ def main():
     num_of_days = int(training_config.get('num_of_days', 1))
     num_of_hours = int(training_config.get('num_of_hours', 3))
     
-    # 噪声配置
+    # 噪声配置（严格遵循论文要求）
+    # PEMS数据集：gaussian_std=10
+    # SZTaxi数据集：gaussian_std=2
+    # 噪声类型：纯高斯噪声
+    dataset_upper = original_data_path.upper()
+    if 'PEMS' in dataset_upper:
+        gaussian_std = 10  # PEMS数据集
+    else:
+        gaussian_std = 2   # SZTaxi数据集
+    
     noise_config = {
-        'gaussian_noise_level': args.noise_level,
-        'block_missing_rate': args.missing_rate,
-        'block_size': 6,
-        'point_missing_rate': args.missing_rate * 0.5,
-        'outlier_rate': args.missing_rate * 1.5,
-        'drift_noise': True
+        'gaussian_mean': 0,
+        'gaussian_std': gaussian_std,
     }
+    
+    print(f"噪声配置：gaussian_mean={noise_config['gaussian_mean']}, gaussian_std={noise_config['gaussian_std']}")
     
     # 生成输出文件名
     dataset_name = os.path.basename(original_data_path).replace('.npz', '')

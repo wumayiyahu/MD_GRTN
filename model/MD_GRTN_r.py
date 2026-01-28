@@ -2,9 +2,8 @@
 import torch
 import torch.nn as nn
 import math
-import torch.nn.functional as F
-from lib.utils import scaled_Laplacian
-
+import torch.nn.functional as F_func
+import numpy as np
 
 # ===== Time embedding（DDPM 标准）=====
 class SinusoidalTimeEmbedding(nn.Module):
@@ -119,10 +118,10 @@ class DiffusionDenoiser(nn.Module):
             x = x0
             
             # U-Net前向传播
-            h1 = F.relu(self.enc1(x))
-            h2 = F.relu(self.enc2(h1))
+            h1 = F_func.relu(self.enc1(x))
+            h2 = F_func.relu(self.enc2(h1))
             
-            h3 = F.relu(self.dec1(h2))
+            h3 = F_func.relu(self.dec1(h2))
             x0_hat_traffic = self.dec2(h3 + h1)  # 直接输出 F 维（交通流空间）
             
             # 投影到 D 维（供主训练使用）
@@ -144,9 +143,9 @@ class DiffusionDenoiser(nn.Module):
             t_emb = self.time_embed(t)
             t_emb = self.time_mlp(t_emb).unsqueeze(-1)
             
-            h1 = F.relu(self.enc1(x_t))
-            h2 = F.relu(self.enc2(h1 + t_emb))
-            h3 = F.relu(self.dec1(h2))
+            h1 = F_func.relu(self.enc1(x_t))
+            h2 = F_func.relu(self.enc2(h1 + t_emb))
+            h3 = F_func.relu(self.dec1(h2))
             eps_hat = self.dec2(h3 + h1)
             
             x0_hat_traffic = (x_t - torch.sqrt(1.0 - alpha_bar_t) * eps_hat) / torch.sqrt(alpha_bar_t)
@@ -229,18 +228,44 @@ class MDAF(nn.Module):
         xh = self.hour(x_hour, use_pure_denoising=use_pure_denoising, return_traffic_space=return_traffic_space)
         xd = self.day(x_day, use_pure_denoising=use_pure_denoising, return_traffic_space=return_traffic_space)
 
-        B, N, D = xr.shape[0], xr.shape[1], xr.shape[2]
+        B, N = xr.shape[0], xr.shape[1]
         T_rec, T_hour, T_day = xr.shape[-1], xh.shape[-1], xd.shape[-1]
         T_max = max(T_rec, T_hour, T_day)
 
         # -------- 2. 统一时间维度到T_max --------
-        if T_rec < T_max:
-            xr = F.interpolate(xr, size=T_max, mode='linear', align_corners=False)
-        if T_hour < T_max:
-            xh = F.interpolate(xh, size=T_max, mode='linear', align_corners=False)
-        if T_day < T_max:
-            xd = F.interpolate(xd, size=T_max, mode='linear', align_corners=False)
-
+        if return_traffic_space:
+            # 预训练模式：变量是 4D (B,N,F,T)，只在时间维度插值
+            # 需要先 reshape 到 3D 才能使用 mode='linear'
+            if T_rec < T_max:
+                _, _, F, _ = xr.shape
+                xr_ = xr.reshape(B * N * F, 1, T_rec)
+                xr_ = F_func.interpolate(xr_, size=T_max, mode='linear', align_corners=False)
+                xr = xr_.reshape(B, N, F, T_max)
+            if T_hour < T_max:
+                _, _, F, _ = xh.shape
+                xh_ = xh.reshape(B * N * F, 1, T_hour)
+                xh_ = F_func.interpolate(xh_, size=T_max, mode='linear', align_corners=False)
+                xh = xh_.reshape(B, N, F, T_max)
+            if T_day < T_max:
+                _, _, F, _ = xd.shape
+                xd_ = xd.reshape(B * N * F, 1, T_day)
+                xd_ = F_func.interpolate(xd_, size=T_max, mode='linear', align_corners=False)
+                xd = xd_.reshape(B, N, F, T_max)
+        else:
+            # 主训练模式：变量是 4D (B,N,D,T)，只在时间维度插值
+            D = xr.shape[2]
+            if T_rec < T_max:
+                xr_ = xr.reshape(B * N * D, 1, T_rec)
+                xr_ = F_func.interpolate(xr_, size=T_max, mode='linear', align_corners=False)
+                xr = xr_.reshape(B, N, D, T_max)
+            if T_hour < T_max:
+                xh_ = xh.reshape(B * N * D, 1, T_hour)
+                xh_ = F_func.interpolate(xh_, size=T_max, mode='linear', align_corners=False)
+                xh = xh_.reshape(B, N, D, T_max)
+            if T_day < T_max:
+                xd_ = xd.reshape(B * N * D, 1, T_day)
+                xd_ = F_func.interpolate(xd_, size=T_max, mode='linear', align_corners=False)
+                xd = xd_.reshape(B, N, D, T_max)
         # -------- 3. reshape for temporal attention --------
         xr = xr.permute(0, 1, 3, 2).reshape(B * N, T_max, D)
         xh = xh.permute(0, 1, 3, 2).reshape(B * N, T_max, D)
@@ -310,7 +335,7 @@ class MGRC(nn.Module):
         # 将两个邻接矩阵堆叠为 (1, 2, N, N)，通过2D卷积融合
         A_concat = torch.cat([Adyna.unsqueeze(0), self.Adist.unsqueeze(0)], dim=0)  # (2,N,N)
         A_concat = A_concat.unsqueeze(0)  # (1,2,N,N)
-        A_F = F.relu(self.graph_fusion(A_concat))  # (1,1,N,N)
+        A_F = F_func.relu(self.graph_fusion(A_concat))  # (1,1,N,N)
         A_F = A_F.squeeze(0).squeeze(0)  # (N,N)
         
         # 修正：对融合后的邻接矩阵进行softmax归一化，防止数值不稳定
@@ -574,7 +599,7 @@ class MD_GRTN(nn.Module):
 
         # STFormer模块：时空Transformer
         # 传入num_nodes和adj_mx，确保A矩阵正确注册和device管理
-        self.stformer = STFormer(D, num_nodes=num_nodes, num_heads=3, num_layers=2, adj_mx=adj_mx)
+        self.stformer = STFormer(D, num_nodes=num_nodes, num_heads=4, num_layers=2, adj_mx=adj_mx)
 
         # 最终预测层（公式26）
         self.predictor = nn.Sequential(
@@ -620,7 +645,7 @@ def make_model(
         D,  # 隐藏维度
         T_out,  # 输出时间步（预测未来时间步数）
         adj_mx,
-        distance_mx=None
+        distance_mx
 ):
     """
     创建MD-GRTN模型

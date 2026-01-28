@@ -163,6 +163,10 @@ def load_md_grtn_data(graph_signal_matrix_filename, num_of_hours, num_of_days, n
                     'day': None
                 }
 
+            def __len__(self):
+                """返回数据集的大小"""
+                return len(self.rec_noisy)
+
             def __getitem__(self, idx):
                 """
                 返回预训练所需的噪声数据作为输入
