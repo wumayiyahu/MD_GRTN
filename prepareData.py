@@ -70,13 +70,19 @@ def get_sample_indices(data_sequence, num_of_weeks, num_of_days, num_of_hours,
                                      for i, j in day_indices], axis=0)
 
     if num_of_hours > 0:
-        hour_indices = search_data(data_sequence.shape[0], num_of_hours,
-                                   label_start_idx, num_for_predict,
-                                   1, points_per_hour)
-        if not hour_indices:
+        # 🔥 修复：确保 Rec 周期的序列长度正确
+        # 根据 MD-GRTN 论文，Rec 表示最近连续的时间序列
+        # 应该取 label_start_idx 前面的 num_of_hours * num_for_predict 个时间点
+        # 例如：num_of_hours=1, num_for_predict=12, points_per_hour=12
+        #      应该取前面的 12 个时间点（1个周期）
+        #      而不是 search_data 逻辑产生的 num_of_hours * num_for_predict 个时间点
+        
+        # 修改：直接取连续的 num_of_hours 个 num_for_predict 长度的序列
+        # 保证 Rec/Hour/Day 的输入时间维度都是 num_for_predict
+        hour_start_idx = label_start_idx - num_of_hours * num_for_predict
+        if hour_start_idx < 0:
             return None, None, None, None
-        hour_sample = np.concatenate([data_sequence[i: j]
-                                      for i, j in hour_indices], axis=0)
+        hour_sample = data_sequence[hour_start_idx: label_start_idx]
 
     target = data_sequence[label_start_idx: label_start_idx + num_for_predict]
 

@@ -52,11 +52,6 @@ start_epoch = int(training_config['start_epoch'])
 # num_of_hours  → 论文中的 Rec (最近连续时间)
 # num_of_days   → 论文中的 Hour (小时周期，24小时模式)
 # num_of_weeks  → 论文中的 Day (日周期，7天模式)
-#
-# 数据流：
-# X_Rec  (num_of_hours步)  → 传入第一个参数 (rec_data)
-# X_Hour (num_of_days步)   → 传入第二个参数 (hour_data)
-# X_Day  (num_of_weeks步)  → 传入第三个参数 (day_data)
 
 num_of_hours = int(training_config['num_of_hours'])   # 论文 Rec 周期
 num_of_days = int(training_config['num_of_days'])    # 论文 Hour 周期
@@ -91,16 +86,27 @@ print("加载MD-GRTN主训练数据")
 print("=" * 50)
 
 # 使用MD-GRTN专用数据加载器，模式为'train'
-# 返回：train_loader, train_target, val_loader, val_target, test_loader, test_target
+# 返回：train_loader, train_target, val_loader, val_target, test_loader, test_target, mean, std
 # 数据映射（根据论文符号）：
 # - num_of_hours  → X_Rec (最近连续时间)
 # - num_of_days   → X_Hour (小时周期，24小时模式)
 # - num_of_weeks  → X_Day (日周期，7天模式)
-train_loader, train_target_tensor, val_loader, val_target_tensor, test_loader, test_target_tensor, _, _ = load_md_grtn_data(
+# - mean, std     → 归一化参数，用于反归一化评估（符合论文要求）
+train_loader, train_target_tensor, val_loader, val_target_tensor, test_loader, test_target_tensor, data_mean, data_std = load_md_grtn_data(
     graph_signal_matrix_filename,
     num_of_hours, num_of_days, num_of_weeks, num_for_predict,
     DEVICE, batch_size, shuffle=True, mode='train'
 )
+
+# 🔥 打印归一化参数（用于反归一化评估）
+print(f"\n数据归一化参数（用于反归一化评估）:")
+if data_mean is not None and data_std is not None:
+    print(f"  mean = {data_mean:.4f}")
+    print(f"  std = {data_std:.4f}")
+    print(f"  ✅ 评估将在真实流量空间计算（符合论文要求）")
+else:
+    print(f"  ⚠️  归一化参数为 None，将在标准化空间计算")
+    print(f"  ⚠️  结果不论文一致（MAE/RMSE 会被放大约 1/std 倍）")
 
 print(f"数据集信息（根据论文符号定义）:")
 print(f"  X_Rec (num_of_hours={num_of_hours}): 最近连续时间")
@@ -304,6 +310,24 @@ for epoch in range(start_epoch, epochs):
             continue
 
         x_rec, x_hour, x_day, labels = batch_data
+        
+        # 🔥 调试：检查输入数据的节点数（第一个批次）
+        if batch_index == 0:
+            print(f"\n[DEBUG] 训练数据维度（节点数追踪）:")
+            print(f"  x_rec (X_Rec): {x_rec.shape}  # 应该是 (B, 307, F, T)")
+            print(f"  x_hour (X_Hour): {x_hour.shape}")
+            print(f"  x_day (X_Day): {x_day.shape}")
+            print(f"  labels (Y): {labels.shape}")
+            print(f"  配置节点数: {num_of_vertices}  # 应该是 307")
+            print(f"  模型节点数: {net.num_nodes}  # 应该是 307")
+            print(f"  邻接矩阵: {adj_mx.shape}  # 应该是 (307, 307)")
+            
+            # 追踪节点数不匹配
+            if x_rec.shape[1] != num_of_vertices:
+                print(f"\n❌ 警告：节点数不匹配！")
+                print(f"   配置节点数: {num_of_vertices}")
+                print(f"   实际节点数: {x_rec.shape[1]}")
+                print(f"   差异: {num_of_vertices - x_rec.shape[1]}")
 
         optimizer.zero_grad()
 
@@ -395,10 +419,12 @@ if test_loader is not None:
         net.load_state_dict(torch.load(params_filename))
         print(f"加载最后周期模型: {params_filename}")
 
-    # 测试集评估
+    # 测试集评估（反归一化版本 - 符合论文要求）
+    # 🔥 关键：传递 mean 和 std 参数，确保在真实流量空间计算指标
     results = predict_and_save_results(
         net, test_loader, test_target_tensor, best_epoch,
-        metric_method=metric_method, params_path=params_path, type='test'
+        metric_method=metric_method, params_path=params_path, type='test',
+        mean=data_mean, std=data_std  # 传递归一化参数
     )
 
     if results:

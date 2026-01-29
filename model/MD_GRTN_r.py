@@ -153,9 +153,30 @@ class DiffusionDenoiser(nn.Module):
             # 投影到 D 维
             x0_hat_hidden = self.project_to_d(x0_hat_traffic)
 
+        # 🔥 安全访问：检查维度并自动修正
+        # 确保 x0_hat_traffic 是 3 维张量 (B*N, F, T)
+        if x0_hat_traffic.dim() != 3:
+            # 如果输出不是 (B*N, F, T)，自动补维度
+            x0_hat_traffic = x0_hat_traffic.unsqueeze(-1)  # 保证有 T 维
+        
+        B_N, F_hat, T_hat = x0_hat_traffic.shape
+        if B_N != B * N or F_hat != self.F_in or T_hat != T:
+            print(f"[WARNING] DiffusionDenoiser: 输出shape与预期不符: {x0_hat_traffic.shape}, 期望 ({B*N}, {self.F_in}, {T})")
+            print(f"  输入原始: x0.shape: {x0.shape}")
+            print(f"  原始维度: B={B}, N={N}, F={F}, T={T}")
+        
         # Reshape
         x0_hat_traffic = x0_hat_traffic.reshape(B, N, self.F_in, T)
         x0_hat_hidden = x0_hat_hidden.reshape(B, N, self.D, T)
+        
+        # 🔥 验证：reshap e 后节点数
+        if x0_hat_traffic.shape[1] != N:
+            print(f"\n[CRITICAL ERROR] DiffusionDenoiser 输出节点数错误！")
+            print(f"  输入: x0.shape=(B,N,F,T)=({B},{N},{F},{T})")
+            print(f"  x0_hat_traffic.shape={x0_hat_traffic.shape}")
+            print(f"  期望节点数: {N}")
+            print(f"  实际节点数: {x0_hat_traffic.shape[1]}")
+            print("  这说明 U-Net 或 reshape 错误地改变了节点数！")
 
         # 根据模式返回
         if return_traffic_space:
@@ -165,26 +186,83 @@ class DiffusionDenoiser(nn.Module):
 
 
 ############################################
-# 2. MDAF: Multi-period Diffusion Attention Fusion
+# 2. Temporal Encoder（论文关键修复）
+############################################
+class TemporalEncoder(nn.Module):
+    """
+    时间编码器：将 (B,N,F,T) 编码为 (B,N,D)
+    
+    论文语义：
+    - 对每个周期进行独立编码
+    - 输出是固定的 D 维特征（不是变长的 T）
+    - 用于后续 MAF 在周期维度（3）上做 attention
+    """
+    def __init__(self, F_in, D, num_nodes=None):
+        super().__init__()
+        self.F_in = F_in
+        self.D = D
+        self.num_nodes = num_nodes  # 用于验证，可为 None 跳过检查
+        
+        # 使用 1D 卷积编码时间维度 (B,N,F,T) → (B,N,D)
+        self.conv1 = nn.Conv1d(F_in, D, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(D, D, kernel_size=3, padding=1)
+        self.pool = nn.AdaptiveAvgPool1d(1)  # 时间池化为1
+
+    def forward(self, x):
+        """
+        参数: x: (B,N,F,T)
+        返回:   (B,N,D)
+        """
+        B, N, F, T = x.shape
+        
+        # 🔥 安全检查：只有指定了 num_nodes 时才验证节点数
+        if self.num_nodes is not None and N != self.num_nodes:
+            print(f"\n[WARNING] TemporalEncoder 输入节点数与预期不符！")
+            print(f"  期望节点数: {self.num_nodes}")
+            print(f"  实际节点数: {N}")
+            print(f"  差异: {self.num_nodes - N}")
+            print(f"  x.shape: {x.shape}")
+        
+        x = x.reshape(B * N, F, T)  # (B*N, F, T)
+        
+        h1 = F_func.relu(self.conv1(x))  # (B*N, D, T)
+        h2 = F_func.relu(self.conv2(h1))  # (B*N, D, T)
+        h_pooled = self.pool(h2).squeeze(-1)  # (B*N, D)
+        
+        result = h_pooled.reshape(B, N, self.D)
+        
+        # 🔥 验证： reshape 后节点数保持不变
+        if self.num_nodes is not None and result.shape[1] != self.num_nodes:
+            print(f"\n[CRITICAL ERROR] TemporalEncoder 输出节点数被改变了！")
+            print(f"  输入: x.shape={x.shape}")
+            print(f"  输出: result.shape={result.shape}")
+            print(f"  期望节点数: {self.num_nodes}")
+            print(f"  这说明某个操作错误地缩减了节点数！")
+        
+        return result
+
+
+############################################
+# 3. MDAF: Multi-period Diffusion Attention Fusion（论文级修复）
 ############################################
 class MDAF(nn.Module):
     """
-    Multi-period Diffusion Attention Fusion
+    Multi-period Diffusion Attention Fusion（论文级修复）
     
     输入 :
         X_rec  : (B,N,F,T_rec)  # 近期序列，长度T_rec
         X_hour : (B,N,F,T_hour) # 小时周期序列，长度T_hour
         X_day  : (B,N,F,T_day)  # 日周期序列，长度T_day
     输出 :
-        X_mdaf : (B,N,D,T_max)  # T_max = max(T_rec, T_hour, T_day)
+        X_mdaf : (B,N,D,T)  # 融合后的D维特征
     
-    功能：
-        1. Diffusion denoising (三个 BackNet_k)
-        2. Temporal self-attention (公式 5–8)
-        3. Multi-period fusion (公式 9)
+    论文架构（修复后）：
+        1. Diffusion denoising (三个 BackNet_k): 去噪 → (B,N,F,T_k)
+        2. Temporal Encoder: 编码 → (B,N,D) [关键修复]？？？
+        3. MAF fusion: 周期间 attention → (B,N,D) [Attention over 3 periods]
     """
 
-    def __init__(self, F_in, D, nhead=1):
+    def __init__(self, F_in, D, num_nodes=None, nhead=1):
         super().__init__()
 
         # -------- Diffusion Denoisers (U-Net) --------
@@ -192,106 +270,100 @@ class MDAF(nn.Module):
         self.hour = DiffusionDenoiser(F_in, D)
         self.day = DiffusionDenoiser(F_in, D)
 
-        # -------- Temporal Self-Attention (公式 5–8) --------
-        self.attn_rec = nn.MultiheadAttention(
-            embed_dim=D, num_heads=nhead, batch_first=True
-        )
-        self.attn_hour = nn.MultiheadAttention(
-            embed_dim=D, num_heads=nhead, batch_first=True
-        )
-        self.attn_day = nn.MultiheadAttention(
-            embed_dim=D, num_heads=nhead, batch_first=True
-        )
+        # -------- Temporal Encoder（关键修复）--------
+        self.encoder_rec = TemporalEncoder(F_in, D, num_nodes)
+        self.encoder_hour = TemporalEncoder(F_in, D, num_nodes)
+        self.encoder_day = TemporalEncoder(F_in, D, num_nodes)
 
-        # -------- Multi-head Fusion (公式 9) --------
-        self.fusion = nn.Linear(3 * D, D)
+        # -------- MAF: Multi-period Attention Fusion（论文公式 9）--------
+        # 关键修复：Attention 在"周期维度"（3）上，不是在节点×时间维度上
+        self.maf_attn = nn.MultiheadAttention(
+            embed_dim=D, num_heads=nhead, batch_first=True
+        )
+        
+        # Fusion: 注意力输出 → 最终特征
+        self.fusion = nn.Linear(D, D)
 
     def forward(self, x_rec, x_hour, x_day, use_pure_denoising=True, return_traffic_space=False):
         """
-        MDAF模块前向传播
+        MDAF模块前向传播（论文级修复）
         
         参数:
-            x_rec: (B,N,F,T_rec) - 近期序列
-            x_hour: (B,N,F,T_hour) - 小时周期序列
-            x_day: (B,N,F,T_day) - 日周期序列
+            x_rec: (B,N,F,T_rec) - 近期序列，F=1
+            x_hour: (B,N,F,T_hour) - 小时周期序列，F=1
+            x_day: (B,N,F,T_day) - 日周期序列，F=1
             use_pure_denoising: bool - 是否使用纯去噪模式（符合论文）
             return_traffic_space: bool - 是否返回交通流空间输出（用于预训练）
-            
+                
         返回:
             如果 return_traffic_space=True:
-                (xr, xh, xd): 三个周期的去噪结果 (B,N,F,T_k)
+                (xr, xh, xd): 三个周期的去噪结果 (B,N,1,T_k)
             如果 return_traffic_space=False:
-                x_fused: (B,N,D,T_max) - 融合后的特征（主训练用）
+                x_fused: (B,N,D) - 融合后的特征（主训练用）
         """
-        # -------- 1. Diffusion denoising --------
-        xr = self.rec(x_rec, use_pure_denoising=use_pure_denoising, return_traffic_space=return_traffic_space)
-        xh = self.hour(x_hour, use_pure_denoising=use_pure_denoising, return_traffic_space=return_traffic_space)
-        xd = self.day(x_day, use_pure_denoising=use_pure_denoising, return_traffic_space=return_traffic_space)
-
-        B, N = xr.shape[0], xr.shape[1]
-        T_rec, T_hour, T_day = xr.shape[-1], xh.shape[-1], xd.shape[-1]
-        T_max = max(T_rec, T_hour, T_day)
-
-        # -------- 2. 统一时间维度到T_max --------
+        B, N, F, _ = x_rec.shape
+        
+        # -------- 1. 预训练模式：使用去噪后的交通流 --------
         if return_traffic_space:
-            # 预训练模式：变量是 4D (B,N,F,T)，只在时间维度插值
-            # 需要先 reshape 到 3D 才能使用 mode='linear'
-            if T_rec < T_max:
-                _, _, F, _ = xr.shape
-                xr_ = xr.reshape(B * N * F, 1, T_rec)
-                xr_ = F_func.interpolate(xr_, size=T_max, mode='linear', align_corners=False)
-                xr = xr_.reshape(B, N, F, T_max)
-            if T_hour < T_max:
-                _, _, F, _ = xh.shape
-                xh_ = xh.reshape(B * N * F, 1, T_hour)
-                xh_ = F_func.interpolate(xh_, size=T_max, mode='linear', align_corners=False)
-                xh = xh_.reshape(B, N, F, T_max)
-            if T_day < T_max:
-                _, _, F, _ = xd.shape
-                xd_ = xd.reshape(B * N * F, 1, T_day)
-                xd_ = F_func.interpolate(xd_, size=T_max, mode='linear', align_corners=False)
-                xd = xd_.reshape(B, N, F, T_max)
-        else:
-            # 主训练模式：变量是 4D (B,N,D,T)，只在时间维度插值
-            D = xr.shape[2]
-            if T_rec < T_max:
-                xr_ = xr.reshape(B * N * D, 1, T_rec)
-                xr_ = F_func.interpolate(xr_, size=T_max, mode='linear', align_corners=False)
-                xr = xr_.reshape(B, N, D, T_max)
-            if T_hour < T_max:
-                xh_ = xh.reshape(B * N * D, 1, T_hour)
-                xh_ = F_func.interpolate(xh_, size=T_max, mode='linear', align_corners=False)
-                xh = xh_.reshape(B, N, D, T_max)
-            if T_day < T_max:
-                xd_ = xd.reshape(B * N * D, 1, T_day)
-                xd_ = F_func.interpolate(xd_, size=T_max, mode='linear', align_corners=False)
-                xd = xd_.reshape(B, N, D, T_max)
-        # -------- 3. reshape for temporal attention --------
-        xr = xr.permute(0, 1, 3, 2).reshape(B * N, T_max, D)
-        xh = xh.permute(0, 1, 3, 2).reshape(B * N, T_max, D)
-        xd = xd.permute(0, 1, 3, 2).reshape(B * N, T_max, D)
+            # Diffusion denoising（直接返回 F=1 维的交通流）
+            xr = self.rec(x_rec, use_pure_denoising=use_pure_denoising, return_traffic_space=True)
+            xh = self.hour(x_hour, use_pure_denoising=use_pure_denoising, return_traffic_space=True)
+            xd = self.day(x_day, use_pure_denoising=use_pure_denoising, return_traffic_space=True)
+            return xr, xh, xd  # (B,N,1,T)
+        
+        # -------- 2. 主训练模式：论文级修复（关键修改）--------
+        # 根据论文，MAF 应该对"原始数据"做编码，而不是对"去噪后的 D 维特征"编码
+        # 两种方案：
+        # 方案A（推荐）：直接编码原始输入，不通过 BackNet 的 D 维输出
+        # 方案B：对 BackNet 输出的 F=1 维交通流编码
+        
+        # 采用方案B：先去噪（得到 F=1 流量），再编码
+        xr = self.rec(x_rec, use_pure_denoising=use_pure_denoising, return_traffic_space=True)
+        xh = self.hour(x_hour, use_pure_denoising=use_pure_denoising, return_traffic_space=True)
+        xd = self.day(x_day, use_pure_denoising=use_pure_denoising, return_traffic_space=True)
+        
+        # 验证：确保是 F=1 维
+        assert xr.shape[2] == 1, f"Expected F=1, got {xr.shape[2]}"
+        assert xh.shape[2] == 1, f"Expected F=1, got {xh.shape[2]}"
+        assert xd.shape[2] == 1, f"Expected F=1, got {xd.shape[2]}"
+        
+        # -------- 3. Temporal Encoding（关键修复）--------
+        # 将 (B,N,1,T) 编码为 (B,N,D)
+        f_rec = self.encoder_rec(xr)   # (B,N,D)
+        f_hour = self.encoder_hour(xh) # (B,N,D)
+        f_day = self.encoder_day(xd)   # (B,N,D)
 
-        # 如果是预训练模式，直接返回交通流空间的去噪结果
-        if return_traffic_space:
-            return xr, xh, xd
+        B, N, D = f_rec.shape
 
-        # -------- 4. Temporal self-attention --------
-        xr_attn, _ = self.attn_rec(xr, xr, xr)
-        xh_attn, _ = self.attn_hour(xh, xh, xh)
-        xd_attn, _ = self.attn_day(xd, xd, xd)
+        # -------- 3. MAF Fusion（论文级修复）--------
+        # 关键：在周期维度（3）上做 attention，不是在 (N×T) 上
+        # 聚合三个周期特征 → (B,N,3,D)
+        periods_cat = torch.stack([f_rec, f_hour, f_day], dim=2)  # (B,N,3,D)
+        
+        # 🔥 关键修复：reshape 成 MHA 可接受的 3D 格式
+        # MultiheadAttention 只接受 (batch, seq, embed)
+        # 论文语义：batch = B*N, seq = 3 (周期）
+        B, N, num_periods, D = periods_cat.shape
+        periods_cat = periods_cat.view(B * N, num_periods, D)  # (B*N, 3, D) ✅
+        
+        # Attention over period dimension (dim=2)
+        # 复杂度：O(N × 3² × D) ≈ O(9N)，而不是 O(N²T²)!
+        f_fused, _ = self.maf_attn(periods_cat, periods_cat, periods_cat)  # (B*N, 3, D)
+        
+        # 周期维聚合：MHA 输出 3 个周期，需要聚合为 1 个
+        f_fused = f_fused.mean(dim=1)  # (B*N, D)
+        
+        # 还原节点维度
+        x_fused = f_fused.view(B, N, D)  # (B, N, D)
+        
+        # Fusion: 取attention输出的特征
+        x_fused = self.fusion(x_fused)  # (B,N,D)
 
-        # -------- 5. Concat + fusion --------
-        x_cat = torch.cat([xr_attn, xh_attn, xd_attn], dim=-1)  # (B*N,T_max,3D)
-        x_fused = self.fusion(x_cat)  # (B*N,T_max,D)
-
-        # -------- 6. reshape back --------
-        x_fused = x_fused.reshape(B, N, T_max, D).permute(0, 1, 3, 2)  # (B,N,D,T_max)
-
-        return x_fused
+        return x_fused  # (B,N,D) - 只返回融合后的D维特征
 
 
 ############################################
-# 3. MGRC: Multi-Graph Recurrent Convolution
+# 4. MGRC: Multi-Graph Recurrent Convolution
 ############################################
 class MGRC(nn.Module):
     """
@@ -362,12 +434,14 @@ class MGRC(nn.Module):
         x, _ = self.gru(x)
         # reshape回 (B,N,D,T_H)
         x = x.reshape(B, N, T_H, D).transpose(2, 3)  # (B,N,D,T_H)
-
-        return x.permute(0, 2, 3, 1)  # (B,N,D,T_H)
+        
+        # 🔥 关键修复：不要再额外 permute，否则 N 会被换成 D！
+        # 正确顺序应该是 (B,N,D,T_H)，不能 permute(0,2,3,1) 变成 (B,D,T_H,N)
+        return x  # (B,N,D,T_H)
 
 
 ############################################
-# 4. STFormer: Spatial-Temporal Transformer 
+# 5. STFormer: Spatial-Temporal Transformer 
 ############################################
 class SpatialTransformer(nn.Module):
     """
@@ -396,13 +470,27 @@ class SpatialTransformer(nn.Module):
         x: (B,N,D) - 空间特征
         A: (N,N) - 邻接矩阵
         """
-        # 加权空间位置编码（公式15）
-        # 使用邻接矩阵对特征进行加权聚合
-        pos_encoding = torch.matmul(A, x)  # (B,N,D)
+        B, N, D = x.shape
+        
+        # 🔥 调试：追踪节点数
+        if A.shape[1] != N:
+            print(f"\n[CRITICAL ERROR] SpatialTransformer 节点数不匹配！")
+            print(f"  A.shape: {A.shape}")
+            print(f"  x.shape: {x.shape}")
+            print(f"  预期A节点数: {N}")
+            print(f"  实际A节点数: {A.shape[1]}")
+            print(f"  差异: {A.shape[1] - N}")
+            print("  这说明在数据流中节点数被错误地改变了！")
+        
+        # 🔥 关键修复：使用 einsum 做批量矩阵乘法
+        # torch.matmul 在 batch 维度不匹配时会报错
+        # einsum 'ij,bjd->bid' 表示：A(N,N) @ x(B,N,D) → pos(B,N,D)
+        # 重要：x 的 N 维必须与 A 的 N 维完全一致！
+        pos_encoding = torch.einsum('ij,bjd->bid', A, x)  # (B,N,D)
         x_with_pos = x + pos_encoding
 
         # 多头注意力（公式16）
-        attn_out, _ = self.spatial_attn(x_with_pos, x_with_pos, x_with_pos)
+        attn_out, _ = self.spatial_attn(x_with_pos, x_with_pos, x_with_pos)  # (B,N,D)
 
         # Add & Normalize（公式17）
         x = self.norm1(x_with_pos + attn_out)
@@ -413,7 +501,7 @@ class SpatialTransformer(nn.Module):
         # Add & Normalize（公式19）
         x = self.norm2(x + ffn_out)
 
-        return x
+        return x  # (B,N,D)
 
 
 class TemporalTransformer(nn.Module):
@@ -529,21 +617,23 @@ class STFormer(nn.Module):
         # 层级处理
         for l in range(self.num_layers):
             # 空间Transformer（处理每个时间步的空间关系）
-            # 改进：reshape后批量处理，避免Python for循环
+            # x: (B,N,D,T_H)
+            # 🔥 关键修复：MD-GRTN中 T_H=1，必须正确处理reshape
             x_permuted = x.permute(0, 3, 1, 2)  # (B,T_H,N,D)
-            x_reshaped = x_permuted.reshape(B * T_H, N, D)  # (B*T_H,N,D)
+            x_reshaped = x_permuted.reshape(B * T_H, N, D).contiguous()  # (B*T_H,N,D)
             
             # 传入register_buffer的A矩阵，确保device一致
+            # A: (N,N), x: (B*T_H,N,D) → output: (B*T_H,N,D)
             x_spatial = self.spatial_layers[l](x_reshaped, A=self.A)  # (B*T_H,N,D)
             
-            x_spatial = x_spatial.reshape(B, T_H, N, D).permute(0, 2, 3, 1)  # (B,N,D,T_H)
+            x_spatial = x_spatial.reshape(B, T_H, N, D).permute(0, 2, 1, 3)  # (B,N,T_H,D)
             
             # 时间Transformer（处理每个节点的时间关系）
-            # 改进：reshape后批量处理，避免Python for循环
-            x_permuted2 = x_spatial.permute(0, 1, 3, 2)  # (B,N,T_H,D)
+            # 🔥 关键修复：正确处理时间维度
+            x_permuted2 = x_spatial.permute(0, 2, 1, 3)  # (B,N,T_H,D) 确保顺序
             x_reshaped2 = x_permuted2.reshape(B * N, T_H, D)  # (B*N,T_H,D)
             
-            # 时间索引需要广播到(B*N, T_H)
+            # 时间索引需要广播到(B*N,T_H)
             hour_idx_broadcast = hour_idx.unsqueeze(1).expand(-1, N, -1).reshape(B * N, T_H)
             day_idx_broadcast = day_idx.unsqueeze(1).expand(-1, N, -1).reshape(B * N, T_H)
             week_idx_broadcast = week_idx.unsqueeze(1).expand(-1, N, -1).reshape(B * N, T_H)
@@ -557,7 +647,7 @@ class STFormer(nn.Module):
 
 
 ############################################
-# 5. MD-GRTN 主模型
+# 6. MD-GRTN 主模型
 ############################################
 class MD_GRTN(nn.Module):
     """
@@ -591,15 +681,17 @@ class MD_GRTN(nn.Module):
         else:
             self.distance_mx = distance_mx.to(DEVICE)
 
-        # MDAF模块：多周期扩散注意力融合
-        self.mdaf = MDAF(F_in, D)
+        # MDAF模块：多周期扩散注意力融合（论文级修复）
+        # 使用修复后论文语义的版本：只在周期维度（3）上做attention
+        # 🔥 修复：传递 num_nodes 参数给 MDAF，用于 TemporalEncoder 验证
+        self.mdaf = MDAF(F_in, D, num_nodes)
 
         # MGRC模块：多图循环卷积
         self.mgrc = MGRC(num_nodes, D, adj_mx, distance_mx, DEVICE)
 
         # STFormer模块：时空Transformer
         # 传入num_nodes和adj_mx，确保A矩阵正确注册和device管理
-        self.stformer = STFormer(D, num_nodes=num_nodes, num_heads=4, num_layers=2, adj_mx=adj_mx)
+        self.stformer = STFormer(D, num_nodes, num_heads=4, num_layers=2, adj_mx=adj_mx)
 
         # 最终预测层（公式26）
         self.predictor = nn.Sequential(
@@ -613,21 +705,22 @@ class MD_GRTN(nn.Module):
     def forward(self, x_rec, x_hour, x_day):
         B = x_rec.shape[0]
 
-        # MDAF模块：多周期扩散注意力融合
-        x = self.mdaf(x_rec, x_hour, x_day)  # (B,N,D,T_max)
+        # MDAF模块：多周期扩散注意力融合（返回 (B,N,D)）
+        x = self.mdaf(x_rec, x_hour, x_day)  # (B,N,D)
 
         # MGRC模块：多图循环卷积
-        x = self.mgrc(x)  # (B,N,D,T_max)
+        # 需要添加时间维度 (B,N,D) → (B,N,D,1)
+        x = x.unsqueeze(-1)  # (B,N,D,1)
+        x = self.mgrc(x)  # (B,N,D,1)
+        # 🔥 关键修复：不要squeeze(-1)，保持(B,N,D,T_H)维度给STFormer
+        # 原代码squeeze(-1)会导致STFormer接收(B,N,D)，内部reshape时错误地将D当成了N
 
-        # STFormer模块：时空Transformer
-        x = self.stformer(x)  # (B,N,D,T_max)
+        # STFormer模块：时空Transformer（期望输入 (B,N,D,T_H)）
+        x = self.stformer(x)  # (B,N,D,T_H)
 
-        # 聚合时间维度并预测未来T_out个时间步（公式26）
-        # 方法1: 使用最后一个时间步
+        # 合并时间维度并预测未来T_out个时间步（公式26）
+        # 使用最后一个时间步
         x_final = x[:, :, :, -1]  # (B,N,D)
-
-        # 方法2: 平均池化（更稳定）
-        # x_final = x.mean(dim=-1)  # (B,N,D)
 
         # 预测未来T_out个时间步
         output = self.predictor(x_final)  # (B,N,T_out)
@@ -636,19 +729,19 @@ class MD_GRTN(nn.Module):
 
 
 ############################################
-# 6. make_model
+# 7. make_model
 ############################################
 def make_model(
         DEVICE,
         num_nodes,
         F_in,  # 输入特征维度（三个序列共享相同的特征维度）
         D,  # 隐藏维度
-        T_out,  # 输出时间步（预测未来时间步数）
+        T_out,  # 输出时间步数（预测的未来时间步数）
         adj_mx,
         distance_mx
 ):
     """
-    创建MD-GRTN模型
+    创建MD-GRTN模型（论文级修复）
 
     参数说明：
     - num_nodes: 节点数量 N
@@ -676,4 +769,3 @@ def make_model(
             nn.init.uniform_(p)
 
     return model
-

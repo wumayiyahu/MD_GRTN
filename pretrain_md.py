@@ -130,66 +130,49 @@ print(net)
 # 预训练阶段使用 MSE Loss（论文 Algorithm 1：去噪重建任务）
 criterion = nn.MSELoss().to(DEVICE)
 
-# ---------------------- 优化器（只优化 MD 模块） ----------------------
+# ---------------------- 优化器（只优化 MD 模块）----------------------
 print("\n" + "=" * 50)
-print("预训练配置（根据论文Algorithm 1）:")
+print("预训练配置（严格符合论文 Algorithm 1）:")
 print("=" * 50)
 
 md_params = []
 
-# 检查模型结构并提取MD模块参数
+# 📌 论文 Algorithm 1 的严格实现：
+# MD 预训练只涉及 BackNet_k（DiffusionDenoiser）
+# 不涉及 MAF（TemporalEncoder + Attention + Fusion）
 if hasattr(net, 'mdaf'):
-    # 修改后：BackNet 直接输出 F 维（交通流空间），
-    #         不再需要 input_projector，直接在 traffic 空间计算 MSE
-    
-    # BackNet_k 参数（扩散去噪器）- 现在输出 F 维
+    # 🔥 关键：只训练 BackNet_k，绝对不涉及 MAF
+    # 论文严格定义：MD = BackNet，独立去噪器
     md_params.extend(list(net.mdaf.rec.parameters()))
     md_params.extend(list(net.mdaf.hour.parameters()))
     md_params.extend(list(net.mdaf.day.parameters()))
     
-    # 验证：排除MA模块参数
-    maf_params_count = 0
-    maf_params_count += sum(p.numel() for p in net.mdaf.attn_rec.parameters())
-    maf_params_count += sum(p.numel() for p in net.mdaf.attn_hour.parameters())
-    maf_params_count += sum(p.numel() for p in net.mdaf.attn_day.parameters())
-    maf_params_count += sum(p.numel() for p in net.mdaf.fusion.parameters())
-    
-    print("=== 真 MD 预训练（最小改动版本）===")
+    print("=== 严格论文级 MD 预训练 ===")
     print()
     print("论文 Algorithm 1 预训练目标:")
     print("  - 输入: 带噪声的交通流 X_k (rec_noisy, hour_noisy, day_noisy)")
     print("  - 去噪: X̂_k = BackNet_k(X_k) - 直接输出 F 维交通流")
-    print("  - 损失: L_pretrain = Σ_k MSE(X̂_k, X_k_clean) - 在 traffic 空间计算")
+    print("  - 损失: L_pretrain = Σ_k MSELoss(X̂_k, X_k_clean)")
     print()
-    print("关键改进:")
-    print("  ✅ BackNet 输出 F 维（交通流空间），不是 D 维")
-    print("  ✅ 损失直接在 traffic 空间计算 MSE(X̂_k, X_k_clean)")
-    print("  ✅ 不再需要 input_projector，实现真实的去噪器")
+    print("关键点（严格遵守论文）:")
+    print("  ✅ BackNet 是独立的去噪器，不经过 MAF 结构")
+    print("  ✅ 输出维度 = F（交通流空间），不是 D")
+    print("  ✅ 损失直接在 traffic 空间计算 MSE，不涉及 attention")
+    print("  ✅ 不做时间对齐（hour/day 和 rec 不需要统一时间维度）")
+    print("  ✅ 不涉及 TemporalEncoder、Attention、Fusion")
     print()
-    print("模块边界:")
-    print(f"  - 训练: MD模块（BackNet_k，真实去噪器）")
-    print(f"  - 冻结: MAF模块（Temporal Attention + Fusion）")
+    print("模块边界（严格符合论文）:")
+    print(f"  - 训练: MD模块（BackNet_k）- 独立去噪器")
+    print(f"  - 不涉及: MAF模块（TemporalEncoder + Attention + Fusion）")
     print()
-    print(f"MD模块参数数量: {sum(p.numel() for p in md_params):,}")
-    print(f"MAF模块参数数量（冻结）: {maf_params_count:,}")
+    print(f"MD模块参数数量（可训练）: {sum(p.numel() for p in md_params):,}")
+    print(f"  - rec (BackNet_k): {sum(p.numel() for p in net.mdaf.rec.parameters()):,}")
+    print(f"  - hour (BackNet_k): {sum(p.numel() for p in net.mdaf.hour.parameters()):,}")
+    print(f"  - day (BackNet_k): {sum(p.numel() for p in net.mdaf.day.parameters()):,}")
     
-elif hasattr(net, 'mdaf'):
-    # 旧版本设计：直接访问子模块
-    md_params.extend(list(net.mdaf.rec.parameters()))
-    md_params.extend(list(net.mdaf.hour.parameters()))
-    md_params.extend(list(net.mdaf.day.parameters()))
-    
-    # 验证：排除MAF模块参数
-    maf_params_count = sum(p.numel() for p in net.mdaf.attn_rec.parameters()) + \
-                      sum(p.numel() for p in net.mdaf.attn_hour.parameters()) + \
-                      sum(p.numel() for p in net.mdaf.attn_day.parameters()) + \
-                      sum(p.numel() for p in net.mdaf.fusion.parameters())
-    
-    print(f"MD模块（扩散去噪器）参数数量: {sum(p.numel() for p in md_params):,}")
-    print(f"MAF模块（注意力融合）参数数量（冻结）: {maf_params_count:,}")
 else:
-    print("警告: 模型没有mdaf属性，将训练所有参数")
-    md_params = list(net.parameters())
+    print("警告: 模型没有mdaf属性，无法进行 MD 预训练")
+    raise SystemExit("预训练失败：需要 MDAF 模块")
 
 # 确保参数列表不为空
 if len(md_params) == 0:
@@ -239,62 +222,65 @@ for epoch in range(start_epoch, epochs):
         # 预训练模式返回6个数据:
         # (rec_noisy, hour_noisy, day_noisy, rec_clean, hour_clean, day_clean)
         # 注意：论文中的命名是 RecN, HourN, DayN（近期、小时周期、日周期）
-        if len(batch_data) != 3:
-            raise RuntimeError(f"预训练 batch 应为 3 个张量，实际为 {len(batch_data)}")
+        if len(batch_data) != 6:
+            raise RuntimeError(f"预训练 batch 应为 6 个张量，实际为 {len(batch_data)}")
 
-        rec_noisy, hour_noisy, day_noisy = batch_data
-
-        # clean 数据 = noisy 去噪前的 ground truth
-        # ⚠️ 前提：你的 Dataset 是「先取 clean，再加噪」
-        rec_clean  = rec_noisy.clone().detach()
-        hour_clean = hour_noisy.clone().detach()
-        day_clean  = day_noisy.clone().detach()
+        rec_noisy, hour_noisy, day_noisy, rec_clean, hour_clean, day_clean = batch_data
+        
+        # 数据形状验证
+        B, N, F, T_rec = rec_noisy.shape
+        _, _, _, T_hour = hour_noisy.shape
+        _, _, _, T_day = day_noisy.shape
+        
+        # 确保clean数据与noisy数据维度匹配
+        assert rec_clean.shape == rec_noisy.shape, f"Rec clean {rec_clean.shape} vs noisy {rec_noisy.shape} 维度不匹配"
+        assert hour_clean.shape == hour_noisy.shape, f"Hour clean {hour_clean.shape} vs noisy {hour_noisy.shape} 维度不匹配"
+        assert day_clean.shape == day_noisy.shape, f"Day clean {day_clean.shape} vs noisy {day_noisy.shape} 维度不匹配"
+        
+        # 打印维度信息（调试用）
+        if batch_index == 0:
+            print(f"数据维度: rec_noisy={rec_noisy.shape}, hour_noisy={hour_noisy.shape}, day_noisy={day_noisy.shape}")
+            print(f"        clean: rec_clean={rec_clean.shape}, hour_clean={hour_clean.shape}, day_clean={day_clean.shape}")
 
         optimizer.zero_grad()
-
-        # 根据论文 Algorithm 1，预训练阶段应该是：
-        #
-        # 论文符号定义：
-        # - X_k: 带噪声的交通流 (rec_noisy, hour_noisy, day_noisy)
-        # - X̂_k (目标): 干净的交通流 (rec_clean, hour_clean, day_clean)
-        # - BackNet_k: 扩散去噪器（MD模块）
-        # - X̂_k (输出): 去噪后的交通流
-        #
-        # Algorithm 1 (真 MD 实现):
-        # Line 3: X̂_k = BackNet_k(X_k)  # BackNet 直接输出 F 维交通流
-        # Line 4: L_pretrain = Σ_k MSE(X̂_k, X̂_k_target)  # 在 traffic 空间计算 MSE
         
         try:
-            # 真 MD 预训练：BackNet 直接输出 F 维交通流
-            # X̂_k = BackNet_k(X_k)
+            # 🔥 严格论文实现：直接调用 BackNet_k，不经过 MDAF
+            # 论文语义：每个 BackNet_k 是独立的去噪器
             if hasattr(net, 'mdaf'):
-                # 直接调用 MDAF 模块的 BackNet，return_traffic_space=True
-                # 输出: (X̂_rec, X̂_hour, X̂_day)，每个都是 (B,N,F,T)
-                X_rec_denoised, X_hour_denoised, X_day_denoised = net.mdaf(
-                    x_rec=rec_noisy,
-                    x_hour=hour_noisy,
-                    x_day=day_noisy,
-                    use_pure_denoising=True,
-                    return_traffic_space=True  # 关键：返回交通流空间（F 维）
-                )
+                # 直接访问 MDAF 内部的 BackNet，跳过 MAF 结构
+                # X̂_rec = BackNet_rec(X_rec_noisy)
+                # 注意：DiffusionDenoiser.forward 的第一个参数是 x0（位置参数），不是 x_rec
+                X_rec_denoised = net.mdaf.rec(rec_noisy, use_pure_denoising=True, return_traffic_space=True)
+                
+                # X̂_hour = BackNet_hour(X_hour_noisy)
+                X_hour_denoised = net.mdaf.hour(hour_noisy, use_pure_denoising=True, return_traffic_space=True)
+                
+                # X̂_day = BackNet_day(X_day_noisy)
+                X_day_denoised = net.mdaf.day(day_noisy, use_pure_denoising=True, return_traffic_space=True)
             else:
-                # 兼容旧版本（向后兼容）
-                print("警告：模型没有mdaf模块，使用默认模式")
-                X_rec_denoised, X_hour_denoised, X_day_denoised = net.mdaf(
-                    x_rec=rec_noisy,
-                    x_hour=hour_noisy,
-                    x_day=day_noisy,
-                    mode="pretrain"
-                )
+                print("错误：模型没有mdaf模块")
+                raise SystemExit("预训练失败：需要 MDAF 模块")
             
-            #  L_pretrain = Σ_k MSE(X̂_k, X_k_clean)
-            # 真 MD 实现：直接在 traffic 空间计算 MSE
-            # X̂_k 是去噪后的交通流 (B,N,F,T)，X_k_clean 是干净交通流 (B,N,F,T)
+            # L_pretrain = Σ_k ||X̂_k - X_k_clean||²
+            # 论文算法：逐元素计算 MSE，不需要任何时间对齐或聚合
+            #
+            # 关键：clean 数据和 noisy 数据是一一对应的，都在 traffic 空间
+            
+            # 验证：维度必须完全匹配
+            assert X_rec_denoised.shape == rec_clean.shape, \
+                f"Rec denoised {X_rec_denoised.shape} vs clean {rec_clean.shape} 维度不匹配"
+            assert X_hour_denoised.shape == hour_clean.shape, \
+                f"Hour denoised {X_hour_denoised.shape} vs clean {hour_clean.shape} 维度不匹配"
+            assert X_day_denoised.shape == day_clean.shape, \
+                f"Day denoised {X_day_denoised.shape} vs clean {day_clean.shape} 维度不匹配"
+            
+            # 直接计算 MSE（论文公式）
             loss_rec = criterion(X_rec_denoised, rec_clean)
             loss_hour = criterion(X_hour_denoised, hour_clean)
             loss_day = criterion(X_day_denoised, day_clean)
             
-            # 总损失 = Σ_k L_k
+            # L_pretrain = Σ_k L_k
             loss = loss_rec + loss_hour + loss_day
 
         except Exception as e:
