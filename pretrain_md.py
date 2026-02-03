@@ -14,7 +14,6 @@ from model.MD_GRTN_r import make_model
 # 修改导入，使用新的数据加载和评估函数
 from lib.utils import load_md_grtn_data, get_adjacency_matrix, compute_val_loss, predict_and_save_results
 from tensorboardX import SummaryWriter
-from lib.metrics import masked_mae, masked_mse, masked_rmse, masked_mape
 
 # ---------------------- 参数和配置 ----------------------
 parser = argparse.ArgumentParser()

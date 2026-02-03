@@ -86,27 +86,16 @@ print("加载MD-GRTN主训练数据")
 print("=" * 50)
 
 # 使用MD-GRTN专用数据加载器，模式为'train'
-# 返回：train_loader, train_target, val_loader, val_target, test_loader, test_target, mean, std
+# 返回：train_loader, train_target, val_loader, val_target, test_loader, test_target
 # 数据映射（根据论文符号）：
 # - num_of_hours  → X_Rec (最近连续时间)
 # - num_of_days   → X_Hour (小时周期，24小时模式)
-# - num_of_weeks  → X_Day (日周期，7天模式)
-# - mean, std     → 归一化参数，用于反归一化评估（符合论文要求）
-train_loader, train_target_tensor, val_loader, val_target_tensor, test_loader, test_target_tensor, data_mean, data_std = load_md_grtn_data(
+# - num_of_weeks  → X_Day (日周期，7天模式）
+train_loader, train_target_tensor, val_loader, val_target_tensor, test_loader, test_target_tensor = load_md_grtn_data(
     graph_signal_matrix_filename,
     num_of_hours, num_of_days, num_of_weeks, num_for_predict,
     DEVICE, batch_size, shuffle=True, mode='train'
 )
-
-# 🔥 打印归一化参数（用于反归一化评估）
-print(f"\n数据归一化参数（用于反归一化评估）:")
-if data_mean is not None and data_std is not None:
-    print(f"  mean = {data_mean:.4f}")
-    print(f"  std = {data_std:.4f}")
-    print(f"  ✅ 评估将在真实流量空间计算（符合论文要求）")
-else:
-    print(f"  ⚠️  归一化参数为 None，将在标准化空间计算")
-    print(f"  ⚠️  结果不论文一致（MAE/RMSE 会被放大约 1/std 倍）")
 
 print(f"数据集信息（根据论文符号定义）:")
 print(f"  X_Rec (num_of_hours={num_of_hours}): 最近连续时间")
@@ -419,12 +408,10 @@ if test_loader is not None:
         net.load_state_dict(torch.load(params_filename))
         print(f"加载最后周期模型: {params_filename}")
 
-    # 测试集评估（反归一化版本 - 符合论文要求）
-    # 🔥 关键：传递 mean 和 std 参数，确保在真实流量空间计算指标
+    # 测试集评估（使用原始数据空间）
     results = predict_and_save_results(
         net, test_loader, test_target_tensor, best_epoch,
-        metric_method=metric_method, params_path=params_path, type='test',
-        mean=data_mean, std=data_std  # 传递归一化参数
+        metric_method=metric_method, params_path=params_path, type='test'
     )
 
     if results:

@@ -91,33 +91,22 @@ def get_sample_indices(data_sequence, num_of_weeks, num_of_days, num_of_hours,
 
 def add_comprehensive_traffic_noise(clean_data, noise_config):
     '''
-    添加高斯噪声（严格遵循论文要求）
-    
-    论文原文：
-    "To obtain noisy traffic flow data, Gaussian noise is added to the original datasets.
-    The Gaussian noise added to PEMS datasets has a mean of 0 and a standard deviation of 10,
-    while for the SZTaxi dataset, the noise has a mean of 0 and a standard deviation of 2.
-    All datasets are standardized using Z-Score normalization before being input into the model."
-    
-    正确流程：
-    1. 原始数据 → Z-Score标准化
-    2. 标准化数据 + N(0, σ) → 加噪声数据
-    3. 输入模型
+    添加高斯噪声（直接在原始数据上添加）
     
     Parameters:
     -----------
-    clean_data: np.ndarray, 干净的归一化数据（已经是Z-Score标准化后的）
+    clean_data: np.ndarray, 干净的原始数据
     noise_config: dict, 噪声配置
         - gaussian_mean: float, 高斯噪声均值（固定为0）
         - gaussian_std: float, 高斯噪声标准差（PEMS=10, SZTaxi=2）
     
     Returns:
     --------
-    noisy_data: np.ndarray, 添加高斯噪声后的数据（归一化尺度）
+    noisy_data: np.ndarray, 添加高斯噪声后的数据
     '''
     noisy_data = clean_data.copy()
     
-    # 添加纯高斯噪声（论文要求：噪声是加在标准化后的干净数据上的）
+    # 添加纯高斯噪声
     gaussian_mean = noise_config.get('gaussian_mean', 0)
     gaussian_std = noise_config.get('gaussian_std', 10)  # 默认PEMS=10
     
@@ -131,28 +120,7 @@ def add_comprehensive_traffic_noise(clean_data, noise_config):
     return noisy_data
 
 
-def normalize_data(train_data, val_data, test_data):
-    '''
-    对数据进行Z-score归一化
-    '''
-    # 计算训练集的统计量
-    mean = train_data.mean(axis=(0, 1, 3), keepdims=True)
-    std = train_data.std(axis=(0, 1, 3), keepdims=True)
-    
-    # 避免除零
-    std = np.where(std == 0, 1.0, std)
-    
-    def normalize(x):
-        return (x - mean) / std
-    
-    train_norm = normalize(train_data)
-    val_norm = normalize(val_data)
-    test_norm = normalize(test_data)
-    
-    return {'mean': mean, 'std': std}, train_norm, val_norm, test_norm
-
-
-def prepare_md_grtn_dataset(original_data_path, 
+def prepare_md_grtn_dataset(original_data_path,
                            num_of_weeks=1, num_of_days=1, num_of_hours=3,
                            num_for_predict=12, points_per_hour=12,
                            noise_config=None, save_path=None):
@@ -318,122 +286,93 @@ def prepare_md_grtn_dataset(original_data_path,
     print(f"   验证集: {len(val_target)} 样本")
     print(f"   测试集: {len(test_target)} 样本")
     
-    # 5. 归一化（先归一化干净数据）
-    print("5. 数据归一化（Z-Score normalization）...")
-    print("   说明：按照论文要求，先进行Z-Score标准化，再添加高斯噪声")
-    print(f"   当前数据集：{original_data_path}")
+    # 5. 生成噪声版本（直接在原始数据上添加高斯噪声）
+    print("5. 生成噪声数据（添加高斯噪声）...")
     print(f"   噪声配置：gaussian_mean={noise_config.get('gaussian_mean', 0)}, gaussian_std={noise_config.get('gaussian_std', 10)}")
     print("-" * 60)
     
-    week_stats, train_week_norm, val_week_norm, test_week_norm = None, None, None, None
-    day_stats, train_day_norm, val_day_norm, test_day_norm = None, None, None, None
-    hour_stats, train_hour_norm, val_hour_norm, test_hour_norm = None, None, None, None
-    
-    if train_week is not None:
-        week_stats, train_week_norm, val_week_norm, test_week_norm = normalize_data(
-            train_week, val_week, test_week
-        )
-        print(f"   周周期归一化完成")
-        
-    if train_day is not None:
-        day_stats, train_day_norm, val_day_norm, test_day_norm = normalize_data(
-            train_day, val_day, test_day
-        )
-        print(f"   日周期归一化完成")
-        
-    if train_hour is not None:
-        hour_stats, train_hour_norm, val_hour_norm, test_hour_norm = normalize_data(
-            train_hour, val_hour, test_hour
-        )
-        print(f"   小时周期归一化完成")
-    
-    # 6. 生成噪声版本（在归一化后的干净数据上添加噪声）
-    # 论文要求：Z-Score标准化后的数据 + N(0, σ) = 噪声数据
-    print("6. 生成噪声数据（添加高斯噪声）...")
-    print("   说明：噪声是加在标准化后的干净数据上")
-    print("-" * 60)
-    
-    # 训练集噪声数据（在归一化数据上添加噪声）
+    # 训练集噪声数据
     train_week_noisy, train_day_noisy, train_hour_noisy = None, None, None
     
-    if train_week_norm is not None:
-        train_week_noisy = add_comprehensive_traffic_noise(train_week_norm, noise_config)
+    if train_week is not None:
+        train_week_noisy = add_comprehensive_traffic_noise(train_week, noise_config)
         print(f"   训练集周周期：添加高斯噪声完成")
         
-    if train_day_norm is not None:
-        train_day_noisy = add_comprehensive_traffic_noise(train_day_norm, noise_config)
+    if train_day is not None:
+        train_day_noisy = add_comprehensive_traffic_noise(train_day, noise_config)
         print(f"   训练集日周期：添加高斯噪声完成")
         
-    if train_hour_norm is not None:
-        train_hour_noisy = add_comprehensive_traffic_noise(train_hour_norm, noise_config)
+    if train_hour is not None:
+        train_hour_noisy = add_comprehensive_traffic_noise(train_hour, noise_config)
         print(f"   训练集小时周期：添加高斯噪声完成")
     
-    # 验证集噪声数据（在归一化数据上添加噪声）
+    # 验证集噪声数据
     val_week_noisy, val_day_noisy, val_hour_noisy = None, None, None
     
-    if val_week_norm is not None:
-        val_week_noisy = add_comprehensive_traffic_noise(val_week_norm, noise_config)
+    if val_week is not None:
+        val_week_noisy = add_comprehensive_traffic_noise(val_week, noise_config)
         print(f"   验证集周周期：添加高斯噪声完成")
         
-    if val_day_norm is not None:
-        val_day_noisy = add_comprehensive_traffic_noise(val_day_norm, noise_config)
+    if val_day is not None:
+        val_day_noisy = add_comprehensive_traffic_noise(val_day, noise_config)
         print(f"   验证集日周期：添加高斯噪声完成")
         
-    if val_hour_norm is not None:
-        val_hour_noisy = add_comprehensive_traffic_noise(val_hour_norm, noise_config)
+    if val_hour is not None:
+        val_hour_noisy = add_comprehensive_traffic_noise(val_hour, noise_config)
         print(f"   验证集小时周期：添加高斯噪声完成")
     
-    # 测试集噪声数据（在归一化数据上添加噪声）
+    # 测试集噪声数据
     test_week_noisy, test_day_noisy, test_hour_noisy = None, None, None
     
-    if test_week_norm is not None:
-        test_week_noisy = add_comprehensive_traffic_noise(test_week_norm, noise_config)
+    if test_week is not None:
+        test_week_noisy = add_comprehensive_traffic_noise(test_week, noise_config)
         print(f"   测试集周周期：添加高斯噪声完成")
         
-    if test_day_norm is not None:
-        test_day_noisy = add_comprehensive_traffic_noise(test_day_norm, noise_config)
+    if test_day is not None:
+        test_day_noisy = add_comprehensive_traffic_noise(test_day, noise_config)
         print(f"   测试集日周期：添加高斯噪声完成")
         
-    if test_hour_norm is not None:
-        test_hour_noisy = add_comprehensive_traffic_noise(test_hour_norm, noise_config)
+    if test_hour is not None:
+        test_hour_noisy = add_comprehensive_traffic_noise(test_hour, noise_config)
         print(f"   测试集小时周期：添加高斯噪声完成")
     
-    # 7. 准备返回的数据字典
+    # 6. 准备返回的数据字典
     dataset_dict = {
         'train': {
-            'week': train_week_norm,           # 干净数据（归一化后）
-            'day': train_day_norm,
-            'hour': train_hour_norm,
-            'week_noisy': train_week_noisy,     # 带噪声数据（在归一化数据上加噪声，模型输入）
+            'week': train_week,           # 原始干净数据
+            'day': train_day,
+            'hour': train_hour,
+            'week_noisy': train_week_noisy,     # 带噪声数据（模型输入）
             'day_noisy': train_day_noisy,
             'hour_noisy': train_hour_noisy,
-            'target': train_target,             # 预测目标（干净流量）
+            'target': train_target,        # 原始预测目标数据
             'timestamp': train_timestamp,
         },
         'val': {
-            'week': val_week_norm,              # 干净数据（归一化后）
-            'day': val_day_norm,
-            'hour': val_hour_norm,
-            'week_noisy': val_week_noisy,       # 带噪声数据（在归一化数据上加噪声，模型输入）
+            'week': val_week,              # 原始干净数据
+            'day': val_day,
+            'hour': val_hour,
+            'week_noisy': val_week_noisy,   # 带噪声数据（模型输入）
             'day_noisy': val_day_noisy,
             'hour_noisy': val_hour_noisy,
-            'target': val_target,               # 预测目标（干净流量）
+            'target': val_target,          # 原始预测目标数据
             'timestamp': val_timestamp,
         },
         'test': {
-            'week': test_week_norm,             # 干净数据（归一化后）
-            'day': test_day_norm,
-            'hour': test_hour_norm,
-            'week_noisy': test_week_noisy,      # 带噪声数据（在归一化数据上加噪声，模型输入）
+            'week': test_week,             # 原始干净数据
+            'day': test_day,
+            'hour': test_hour,
+            'week_noisy': test_week_noisy,  # 带噪声数据（模型输入）
             'day_noisy': test_day_noisy,
             'hour_noisy': test_hour_noisy,
-            'target': test_target,              # 预测目标（干净流量）
+            'target': test_target,         # 原始预测目标数据
             'timestamp': test_timestamp,
         },
         'stats': {
-            'week': week_stats,
-            'day': day_stats,
-            'hour': hour_stats,
+            'week': None,
+            'day': None,
+            'hour': None,
+            'target': None,
         },
         'config': {
             'num_of_weeks': num_of_weeks,
@@ -449,9 +388,9 @@ def prepare_md_grtn_dataset(original_data_path,
         }
     }
     
-    # 8. 保存数据
+    # 7. 保存数据
     if save_path is not None:
-        print("7. 保存数据...")
+        print("6. 保存数据...")
         
         # 确保目录存在
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -460,53 +399,47 @@ def prepare_md_grtn_dataset(original_data_path,
         save_dict = {}
         
         # 添加训练数据
-        if train_week_norm is not None:
+        if train_week is not None:
             save_dict.update({
-                'train_week': train_week_norm,
+                'train_week': train_week,
                 'train_week_noisy': train_week_noisy,
-                'week_mean': week_stats['mean'] if week_stats else 0,
-                'week_std': week_stats['std'] if week_stats else 1,
             })
             
-        if train_day_norm is not None:
+        if train_day is not None:
             save_dict.update({
-                'train_day': train_day_norm,
+                'train_day': train_day,
                 'train_day_noisy': train_day_noisy,
-                'day_mean': day_stats['mean'] if day_stats else 0,
-                'day_std': day_stats['std'] if day_stats else 1,
             })
             
-        if train_hour_norm is not None:
+        if train_hour is not None:
             save_dict.update({
-                'train_hour': train_hour_norm,
+                'train_hour': train_hour,
                 'train_hour_noisy': train_hour_noisy,
-                'hour_mean': hour_stats['mean'] if hour_stats else 0,
-                'hour_std': hour_stats['std'] if hour_stats else 1,
             })
         
-        # 添加验证和测试数据（MD-GRTN：输入使用噪声数据）
-        if val_week_norm is not None:
+        # 添加验证和测试数据
+        if val_week is not None:
             save_dict.update({
-                'val_week': val_week_norm,           # 干净数据（归一化）
-                'val_week_noisy': val_week_noisy,     # 带噪声数据（模型输入）
-                'test_week': test_week_norm,
-                'test_week_noisy': test_week_noisy,   # 带噪声数据（模型输入）
+                'val_week': val_week,
+                'val_week_noisy': val_week_noisy,
+                'test_week': test_week,
+                'test_week_noisy': test_week_noisy,
             })
             
-        if val_day_norm is not None:
+        if val_day is not None:
             save_dict.update({
-                'val_day': val_day_norm,             # 干净数据（归一化）
-                'val_day_noisy': val_day_noisy,       # 带噪声数据（模型输入）
-                'test_day': test_day_norm,
-                'test_day_noisy': test_day_noisy,     # 带噪声数据（模型输入）
+                'val_day': val_day,
+                'val_day_noisy': val_day_noisy,
+                'test_day': test_day,
+                'test_day_noisy': test_day_noisy,
             })
             
-        if val_hour_norm is not None:
+        if val_hour is not None:
             save_dict.update({
-                'val_hour': val_hour_norm,           # 干净数据（归一化）
-                'val_hour_noisy': val_hour_noisy,     # 带噪声数据（模型输入）
-                'test_hour': test_hour_norm,
-                'test_hour_noisy': test_hour_noisy,   # 带噪声数据（模型输入）
+                'val_hour': val_hour,
+                'val_hour_noisy': val_hour_noisy,
+                'test_hour': test_hour,
+                'test_hour_noisy': test_hour_noisy,
             })
         
         # 添加目标数据和时间戳

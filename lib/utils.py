@@ -8,26 +8,6 @@ from scipy.sparse.linalg import eigs
 from .metrics import masked_mape_np, masked_mae, masked_mse, masked_rmse, masked_mae_test, masked_rmse_test
 
 
-def re_normalization(x, mean, std):
-    """反归一化"""
-    x = x * std + mean
-    return x
-
-
-def max_min_normalization(x, _max, _min):
-    """最大最小归一化"""
-    x = 1. * (x - _min) / (_max - _min)
-    x = x * 2. - 1.
-    return x
-
-
-def re_max_min_normalization(x, _max, _min):
-    """反最大最小归一化"""
-    x = (x + 1.) / 2.
-    x = 1. * x * (_max - _min) + _min
-    return x
-
-
 def get_adjacency_matrix(distance_df_filename, num_of_vertices, id_filename=None):
     '''
     获取邻接矩阵
@@ -100,7 +80,7 @@ def load_md_grtn_data(graph_signal_matrix_filename, num_of_hours, num_of_days, n
 
     Returns
     ----------
-    train_loader, train_target_tensor, val_loader, val_target_tensor, test_loader, test_target_tensor, mean, std
+    train_loader, train_target_tensor, val_loader, val_target_tensor, test_loader, test_target_tensor
     '''
 
     file = os.path.basename(graph_signal_matrix_filename).split('.')[0]
@@ -193,9 +173,9 @@ def load_md_grtn_data(graph_signal_matrix_filename, num_of_hours, num_of_days, n
                 
                 # 提取对应的干净数据（监督信号）- 关键：从 clean 张量中获取
                 # 确保索引一致，无论 DataLoader 是否打乱顺序
-                rec_clean = self.rec_clean[idx][:, :, :]   # (N, 1, T) - X̂_Rec (标准化后的干净数据)
-                hour_clean = self.hour_clean[idx][:, :, :] # (N, 1, T) - X̂_Hour (标准化后的干净数据)
-                day_clean = self.day_clean[idx][:, :, :]   # (N, 1, T) - X̂_Day (标准化后的干净数据)
+                rec_clean = self.rec_clean[idx][:, :, :]   # (N, 1, T) - X̂_Rec (干净的原始数据)
+                hour_clean = self.hour_clean[idx][:, :, :] # (N, 1, T) - X̂_Hour (干净的原始数据)
+                day_clean = self.day_clean[idx][:, :, :]   # (N, 1, T) - X̂_Day (干净的原始数据)
                 
                 return rec_noisy, hour_noisy, day_noisy, rec_clean, hour_clean, day_clean
             
@@ -204,9 +184,9 @@ def load_md_grtn_data(graph_signal_matrix_filename, num_of_hours, num_of_days, n
             train_hour_noisy_tensor,  # 噪声数据：X_Rec (num_of_hours步)
             train_day_noisy_tensor,   # 噪声数据：X_Hour (num_of_days步)
             train_week_noisy_tensor,  # 噪声数据：X_Day (num_of_weeks步)
-            train_hour_tensor,        # 干净数据：X̂_Rec (num_of_hours步，标准化后) - 监督信号
-            train_day_tensor,         # 干净数据：X̂_Hour (num_of_days步，标准化后) - 监督信号
-            train_week_tensor         # 干净数据：X̂_Day (num_of_weeks步，标准化后) - 监督信号
+            train_hour_tensor,        # 干净数据：X̂_Rec (num_of_hours步) - 监督信号
+            train_day_tensor,         # 干净数据：X̂_Hour (num_of_days步) - 监督信号
+            train_week_tensor         # 干净数据：X̂_Day (num_of_weeks步) - 监督信号
         )
 
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle)
@@ -329,35 +309,10 @@ def load_md_grtn_data(graph_signal_matrix_filename, num_of_hours, num_of_days, n
         print(f"训练集 - X_Rec(num_of_hours): {train_hour_tensor.size()}, X_Hour(num_of_days): {train_day_tensor.size()}, X_Day(num_of_weeks): {train_week_tensor.size() if train_week_tensor is not None else 'None'}, 目标: {train_target_tensor.size()}")
         print(f"验证集 - X_Rec: {val_hour_tensor.size()}, X_Hour: {val_day_tensor.size()}, X_Day: {val_week_tensor.size() if val_week_tensor is not None else 'None'}, 目标: {val_target_tensor.size()}")
         print(f"测试集 - X_Rec: {test_hour_tensor.size()}, X_Hour: {test_day_tensor.size()}, X_Day: {test_week_tensor.size() if test_week_tensor is not None else 'None'}, 目标: {test_target_tensor.size()}")
-        
-        # 🔥 关键修复：提取 mean 和 std 用于反归一化评估（符合论文要求）
-        # 论文要求：所有评估指标在真实交通流量空间（veh/5min）计算
-        # 因此需要保存数据的归一化参数，用于后续反归一化
-        # 目标数据使用哪个周期的归一化参数？使用 hour (Rec) 周期的参数，因为这是最主要的周期
-        mean = None
-        std = None
-        
-        # 按优先级提取归一化参数
-        if 'hour_mean' in file_data:
-            mean = file_data['hour_mean'].item()  # 提取标量值
-            std = file_data['hour_std'].item()
-            print(f"使用 Hour(Rec) 周期的归一化参数: mean={mean:.4f}, std={std:.4f}")
-        elif 'day_mean' in file_data:
-            mean = file_data['day_mean'].item()
-            std = file_data['day_std'].item()
-            print(f"使用 Day 周期的归一化参数: mean={mean:.4f}, std={std:.4f}")
-        elif 'week_mean' in file_data:
-            mean = file_data['week_mean'].item()
-            std = file_data['week_std'].item()
-            print(f"使用 Week 周期的归一化参数: mean={mean:.4f}, std={std:.4f}")
-        else:
-            print("⚠️  警告：数据文件中没有找到归一化参数，无法反归一化")
-            print("  评估将在标准化空间计算，结果不论文一致")
 
         return (train_loader, train_target_tensor,
                 val_loader, val_target_tensor,
-                test_loader, test_target_tensor,
-                mean, std)  # 返回归一化参数用于反归一化
+                test_loader, test_target_tensor)
 
 
 def compute_val_loss_md_grtn(net, val_loader, criterion, masked_flag, missing_value, sw, epoch, limit=None):
@@ -433,21 +388,19 @@ def to_numpy(x):
 
 
 def predict_and_save_results_md_grtn(net, data_loader, data_target_tensor, global_step, metric_method,
-                                      params_path, type='test', mean=None, std=None):
+                                      params_path, type='test'):
     '''
-    为MD-GRTN模型预测并保存结果（反归一化版本 - 符合论文）
+    为MD-GRTN模型预测并保存结果
     
     Parameters
     ----------
     net: MD-GRTN模型
     data_loader: torch.utils.data.DataLoader
-    data_target_tensor: torch.Tensor, 目标数据（标准化空间）
+    data_target_tensor: torch.Tensor, 目标数据
     global_step: int, 当前全局步数
     metric_method: str, 'mask' 或 'unmask'
     params_path: str, 结果保存路径
     type: str, 'train', 'val', 或 'test'
-    mean: float, 数据均值（用于反归一化）
-    std: float, 数据标准差（用于反归一化）
     
     Returns
     ----------
@@ -455,17 +408,7 @@ def predict_and_save_results_md_grtn(net, data_loader, data_target_tensor, globa
     '''
     net.eval()
     
-    # 🔥 关键修复：验证是否需要反归一化
-    # 论文要求：所有评估指标在真实交通流量空间（veh/5min）计算
-    # 当前流程：模型输出（标准化）→ 必须反归一化 → 再算指标
-    
-    if mean is None or std is None:
-        print("\n⚠️  警告：没有提供 mean 和 std，无法反归一化！")
-        print("  指标将在标准化空间计算，结果不论文一致！")
-        print("  请确保数据加载时保存并传递 mean/std 参数")
-    else:
-        print(f"\n✅ 使用反归一化：mean={mean:.4f}, std={std:.4f}")
-        print("  所有指标会在真实交通流量空间计算（符合论文要求）")
+    print(f"\n评估模式：使用原始数据空间计算指标（无归一化/反归一化）")
     
     with torch.no_grad():
         data_target_tensor_norm = data_target_tensor.cpu().numpy()
@@ -538,23 +481,9 @@ def predict_and_save_results_md_grtn(net, data_loader, data_target_tensor, globa
         np.savez(output_filename, **save_dict)
         print(f'结果已保存到: {output_filename}')
 
-        # 📌 绝对安全做法：在标准化空间计算指标（避免反归一化多次或参数错误）
-        #
-        # 优点：
-        #   - 100% 安全，不会出现指标被异常放大的问题
-        #   - 不依赖 mean/std 参数的有效性
-        #   - 符合标准化空间的评估逻辑
-        #
-        # 说明：
-        #   - 数值不会和论文表格完全一致（论文表格在真实流量空间）
-        #   - 但量级一定合理（MAE ~ 0.1~0.3 为正常）
-        #   - 如需与论文表格数值一致，后续可在真实流量空间重新计算
-        
-        # 确保 data_target_tensor 和 prediction 都是 NumPy 数组（已在前面处理）
-        # 这里再次确认，避免遗漏任何情况
+        # 确保 data_target_tensor 和 prediction 都是 NumPy 数组
         if torch.is_tensor(data_target_tensor):
             data_target_tensor = data_target_tensor.cpu().numpy()
-        
         if isinstance(prediction, torch.Tensor):
             prediction = prediction.cpu().numpy()
 
@@ -562,17 +491,10 @@ def predict_and_save_results_md_grtn(net, data_loader, data_target_tensor, globa
             excel_list = []
             prediction_length = prediction.shape[2]
             
-            print("\n✅ 采用标准化空间计算指标（绝对安全模式）")
-            print("  → prediction 和 data_target 都在标准化空间")
-            print("  → MAE/RMSE 应该在 0.1~0.3 量级（模型性能正常）")
-            
-            # 直接使用标准化数据（不反归一化，避免多次反归一化或参数错误）
-            y_true = data_target_tensor
-            y_pred = prediction
-            
-            print(f"\n数据范围检查（标准化空间）：")
-            print(f"  target  范围: [{y_true.min():.4f}, {y_true.max():.4f}]")
-            print(f"  prediction 范围: [{y_pred.min():.4f}, {y_pred.max():.4f}]")
+            # 使用原始数据空间计算指标（无归一化）
+            print(f"\n数据范围检查（原始数据空间）：")
+            print(f"  target  范围: [{data_target_tensor.min():.2f}, {data_target_tensor.max():.2f}]")
+            print(f"  prediction 范围: [{prediction.min():.2f}, {prediction.max():.2f}]")
             
             # 逐时间点计算指标
             for i in range(prediction_length):
@@ -580,51 +502,34 @@ def predict_and_save_results_md_grtn(net, data_loader, data_target_tensor, globa
                 print(f'当前周期: {global_step}, 预测第 {i} 个时间点')
                 
                 if metric_method == 'mask':
-                    mae = masked_mae_test(y_true[:, :, i], y_pred[:, :, i], 0.0)
-                    rmse = masked_rmse_test(y_true[:, :, i], y_pred[:, :, i], 0.0)
-                    mape = masked_mape_np(y_true[:, :, i], y_pred[:, :, i], 0)
+                    mae = masked_mae_test(data_target_tensor[:, :, i], prediction[:, :, i], 0.0)
                 else:
-                    mae = mean_absolute_error(y_true[:, :, i], y_pred[:, :, i])
-                    rmse = mean_squared_error(y_true[:, :, i], y_pred[:, :, i]) ** 0.5
-                    mape = masked_mape_np(y_true[:, :, i], y_pred[:, :, i], 0)
-                
-                print(f'MAE: {mae:.4f}')
-                print(f'RMSE: {rmse:.4f}')
-                print(f'MAPE: {mape:.4f}')
+                    mae = mean_absolute_error(data_target_tensor[:, :, i].flatten(),
+                                             prediction[:, :, i].flatten())
+
+                if metric_method == 'mask':
+                    rmse = masked_rmse_test(data_target_tensor[:, :, i], prediction[:, :, i])
+                else:
+                    rmse = mean_squared_error(data_target_tensor[:, :, i].flatten(),
+                                              prediction[:, :, i].flatten(), squared=False)
+
+                # MAPE 计算
+                mape = masked_mape_np(data_target_tensor[:, :, i], prediction[:, :, i])
+
+                print('MAE: %.2f, RMSE: %.2f, MAPE: %.2f%%' % (mae, rmse, mape * 100))
+
+                # 记录结果
                 excel_list.extend([mae, rmse, mape])
-            
-            # 整体结果
-            if metric_method == 'mask':
-                mae = masked_mae_test(y_true.reshape(-1, 1), y_pred.reshape(-1, 1), 0.0)
-                rmse = masked_rmse_test(y_true.reshape(-1, 1), y_pred.reshape(-1, 1), 0.0)
-                mape = masked_mape_np(y_true.reshape(-1, 1), y_pred.reshape(-1, 1), 0)
-            else:
-                mae = mean_absolute_error(y_true.reshape(-1, 1), y_pred.reshape(-1, 1))
-                rmse = mean_squared_error(y_true.reshape(-1, 1), y_pred.reshape(-1, 1)) ** 0.5
-                mape = masked_mape_np(y_true.reshape(-1, 1), y_pred.reshape(-1, 1), 0)
-            
-            print(f'整体 MAE: {mae:.4f}')
-            print(f'整体 RMSE: {rmse:.4f}')
-            print(f'整体 MAPE: {mape:.4f}')
-            excel_list.extend([mae, rmse, mape])
-            print(f'评估结果列表: {excel_list}')
 
             return excel_list
         else:
-            print('错误: 预测结果与目标数据形状不匹配')
             return None
 
 
-# MD-GRTN专用函数别名（保持接口一致性）
-def compute_val_loss(net, val_loader, criterion, masked_flag, missing_value, sw, epoch, limit=None):
-    '''MD-GRTN验证损失计算函数'''
-    return compute_val_loss_md_grtn(net, val_loader, criterion, masked_flag, missing_value, sw, epoch, limit)
-
-
-def predict_and_save_results(net, data_loader, data_target_tensor, global_step, metric_method, params_path,
-                             type='test', mean=None, std=None):
-    '''MD-GRTN预测和保存结果函数（反归一化版本）'''
+def predict_and_save_results_md_grtn_pretrain(net, data_loader, global_step, metric_method,
+                              params_path, type='test'):
+    '''MD-GRTN预测和保存结果函数'''
     return predict_and_save_results_md_grtn(
-        net, data_loader, data_target_tensor, global_step,
-        metric_method, params_path, type, mean, std
+        net, data_loader, None, global_step,
+        metric_method, params_path, type
     )
