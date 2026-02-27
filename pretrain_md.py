@@ -1,6 +1,3 @@
-#!/usr/bin/env python
-# coding: utf-8
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -11,8 +8,7 @@ import argparse
 import configparser
 from time import time
 from model.MD_GRTN_r import make_model
-# 修改导入，使用新的数据加载和评估函数
-from lib.utils import load_md_grtn_data, get_adjacency_matrix, compute_val_loss, predict_and_save_results
+from lib.utils import load_md_grtn_data, get_adjacency_matrix
 from tensorboardX import SummaryWriter
 
 # ---------------------- 参数和配置 ----------------------
@@ -46,26 +42,21 @@ print("使用设备:", DEVICE)
 
 batch_size = int(training_config['batch_size'])
 learning_rate = float(training_config['learning_rate'])
-epochs = int(training_config['epochs'])
+epochs = 15
 start_epoch = int(training_config['start_epoch'])
 
+num_of_recs = int(training_config['num_of_recs'])
 num_of_hours = int(training_config['num_of_hours'])
 num_of_days = int(training_config['num_of_days'])
-num_of_weeks = int(training_config['num_of_weeks'])
 
 # MD-GRTN模型参数
 in_channels = int(training_config['in_channels'])  # 输入特征维度
 hidden_dim = int(training_config.get('hidden_dim', 64))  # 隐藏层维度
-num_heads = int(training_config.get('num_heads', 4))  # 注意力头数
-num_layers = int(training_config.get('num_layers', 2))  # Transformer层数
 
-loss_function = training_config['loss_function']
-metric_method = training_config.get('metric_method', 'unmask')
-missing_value = float(training_config.get('missing_value', 0.0))
 
 # 修改文件夹命名，包含MD-GRTN标识
 folder_dir = 'MD_GRTN_pretrain_h%dd%dw%d_channel%d_hidden%d_%e' % (
-    num_of_hours, num_of_days, num_of_weeks, in_channels, hidden_dim, learning_rate
+    num_of_recs, num_of_hours, num_of_days, in_channels, hidden_dim, learning_rate
 )
 params_path = os.path.join('experiments', dataset_name, folder_dir)
 print('参数保存路径:', params_path)
@@ -78,7 +69,7 @@ print("=" * 50)
 # 使用MD-GRTN专用数据加载器，模式为'pretrain'
 train_loader, _, _, _, _, _, _, _ = load_md_grtn_data(
     graph_signal_matrix_filename,
-    num_of_hours, num_of_days, num_of_weeks, num_for_predict,
+    num_of_recs, num_of_hours, num_of_days, num_for_predict,
     DEVICE, batch_size, shuffle=True, mode='pretrain'
 )
 print(f"训练批次: {len(train_loader)}")
@@ -86,7 +77,7 @@ print(f"训练批次: {len(train_loader)}")
 # 为验证集加载主训练数据
 _, _, val_loader, val_target_tensor, test_loader, test_target_tensor, _, _ = load_md_grtn_data(
     graph_signal_matrix_filename,
-    num_of_hours, num_of_days, num_of_weeks, num_for_predict,
+    num_of_recs, num_of_hours, num_of_days, num_for_predict,
     DEVICE, batch_size, shuffle=False, mode='train'
 )
 
@@ -136,33 +127,15 @@ print("=" * 50)
 
 md_params = []
 
-# 📌 论文 Algorithm 1 的严格实现：
-# MD 预训练只涉及 BackNet_k（DiffusionDenoiser）
-# 不涉及 MAF（TemporalEncoder + Attention + Fusion）
+# 论文 Algorithm 1 的严格实现：
+# MD 预训练只涉及 BackNet_k（DiffusionDenoiser）不涉及 MAF（TemporalEncoder + Attention + Fusion）
 if hasattr(net, 'mdaf'):
-    # 🔥 关键：只训练 BackNet_k，绝对不涉及 MAF
     # 论文严格定义：MD = BackNet，独立去噪器
     md_params.extend(list(net.mdaf.rec.parameters()))
     md_params.extend(list(net.mdaf.hour.parameters()))
     md_params.extend(list(net.mdaf.day.parameters()))
     
-    print("=== 严格论文级 MD 预训练 ===")
-    print()
-    print("论文 Algorithm 1 预训练目标:")
-    print("  - 输入: 带噪声的交通流 X_k (rec_noisy, hour_noisy, day_noisy)")
-    print("  - 去噪: X̂_k = BackNet_k(X_k) - 直接输出 F 维交通流")
-    print("  - 损失: L_pretrain = Σ_k MSELoss(X̂_k, X_k_clean)")
-    print()
-    print("关键点（严格遵守论文）:")
-    print("  ✅ BackNet 是独立的去噪器，不经过 MAF 结构")
-    print("  ✅ 输出维度 = F（交通流空间），不是 D")
-    print("  ✅ 损失直接在 traffic 空间计算 MSE，不涉及 attention")
-    print("  ✅ 不做时间对齐（hour/day 和 rec 不需要统一时间维度）")
-    print("  ✅ 不涉及 TemporalEncoder、Attention、Fusion")
-    print()
-    print("模块边界（严格符合论文）:")
-    print(f"  - 训练: MD模块（BackNet_k）- 独立去噪器")
-    print(f"  - 不涉及: MAF模块（TemporalEncoder + Attention + Fusion）")
+    print("===  MD 预训练 ===")
     print()
     print(f"MD模块参数数量（可训练）: {sum(p.numel() for p in md_params):,}")
     print(f"  - rec (BackNet_k): {sum(p.numel() for p in net.mdaf.rec.parameters()):,}")
@@ -201,9 +174,9 @@ elif (start_epoch > 0) and os.path.exists(params_path):
 else:
     raise SystemExit("错误的参数路径!")
 
-# ---------------------- 主训练循环 ----------------------
+# ---------------------- 主训练循环（严格 DDPM 预训练）----------------------
 print("\n" + "=" * 50)
-print("开始MD模块预训练")
+print("开始 MD 模块严格 DDPM 预训练")
 print("=" * 50)
 
 best_train_loss = np.inf
@@ -220,66 +193,56 @@ for epoch in range(start_epoch, epochs):
     for batch_index, batch_data in enumerate(train_loader):
         # 预训练模式返回6个数据:
         # (rec_noisy, hour_noisy, day_noisy, rec_clean, hour_clean, day_clean)
-        # 注意：论文中的命名是 RecN, HourN, DayN（近期、小时周期、日周期）
-        if len(batch_data) != 6:
-            raise RuntimeError(f"预训练 batch 应为 6 个张量，实际为 {len(batch_data)}")
-
+        # *_noisy: 外部环境噪声数据
+        # *_clean: 原始干净数据（用于计算 loss）
         rec_noisy, hour_noisy, day_noisy, rec_clean, hour_clean, day_clean = batch_data
-        
+
         # 数据形状验证
         B, N, F, T_rec = rec_noisy.shape
         _, _, _, T_hour = hour_noisy.shape
         _, _, _, T_day = day_noisy.shape
-        
-        # 确保clean数据与noisy数据维度匹配
+
+        # 验证维度匹配
         assert rec_clean.shape == rec_noisy.shape, f"Rec clean {rec_clean.shape} vs noisy {rec_noisy.shape} 维度不匹配"
         assert hour_clean.shape == hour_noisy.shape, f"Hour clean {hour_clean.shape} vs noisy {hour_noisy.shape} 维度不匹配"
         assert day_clean.shape == day_noisy.shape, f"Day clean {day_clean.shape} vs noisy {day_noisy.shape} 维度不匹配"
+
+        optimizer.zero_grad()
+
+        # -------- X_t → X_0 去噪映射 --------
+        # 输入: *_noisy (外部环境噪声，直接当作 X_t)
+        # 网络学习: X_t → X_0 (去噪映射)
+        # 输出: x0_hat (去噪结果)
+        # Loss = MSE(x0_hat, *_clean)
         
-        # 打印维度信息（调试用）
+        # 验证数据维度（调试用）
         if batch_index == 0:
             print(f"数据维度: rec_noisy={rec_noisy.shape}, hour_noisy={hour_noisy.shape}, day_noisy={day_noisy.shape}")
             print(f"        clean: rec_clean={rec_clean.shape}, hour_clean={hour_clean.shape}, day_clean={day_clean.shape}")
 
-        optimizer.zero_grad()
-        
         try:
-            # 🔥 严格论文实现：直接调用 BackNet_k，不经过 MDAF
-            # 论文语义：每个 BackNet_k 是独立的去噪器
+            # 传入noisy数据，直接去噪（不额外添加噪声）
             if hasattr(net, 'mdaf'):
-                # 直接访问 MDAF 内部的 BackNet，跳过 MAF 结构
-                # X̂_rec = BackNet_rec(X_rec_noisy)
-                # 注意：DiffusionDenoiser.forward 的第一个参数是 x0（位置参数），不是 x_rec
-                X_rec_denoised = net.mdaf.rec(rec_noisy, use_pure_denoising=True, return_traffic_space=True)
-                
-                # X̂_hour = BackNet_hour(X_hour_noisy)
-                X_hour_denoised = net.mdaf.hour(hour_noisy, use_pure_denoising=True, return_traffic_space=True)
-                
-                # X̂_day = BackNet_day(X_day_noisy)
-                X_day_denoised = net.mdaf.day(day_noisy, use_pure_denoising=True, return_traffic_space=True)
+                X_rec_denoised = net.mdaf.rec(rec_noisy, return_traffic_space=True)
+                X_hour_denoised = net.mdaf.hour(hour_noisy, return_traffic_space=True)
+                X_day_denoised = net.mdaf.day(day_noisy, return_traffic_space=True)
             else:
                 print("错误：模型没有mdaf模块")
                 raise SystemExit("预训练失败：需要 MDAF 模块")
-            
-            # L_pretrain = Σ_k ||X̂_k - X_k_clean||²
-            # 论文算法：逐元素计算 MSE，不需要任何时间对齐或聚合
-            #
-            # 关键：clean 数据和 noisy 数据是一一对应的，都在 traffic 空间
-            
-            # 验证：维度必须完全匹配
+
+            # 验证维度
             assert X_rec_denoised.shape == rec_clean.shape, \
                 f"Rec denoised {X_rec_denoised.shape} vs clean {rec_clean.shape} 维度不匹配"
             assert X_hour_denoised.shape == hour_clean.shape, \
                 f"Hour denoised {X_hour_denoised.shape} vs clean {hour_clean.shape} 维度不匹配"
             assert X_day_denoised.shape == day_clean.shape, \
                 f"Day denoised {X_day_denoised.shape} vs clean {day_clean.shape} 维度不匹配"
-            
-            # 直接计算 MSE（论文公式）
+
+            # -------- MSE loss --------
+            # 损失：去噪结果 vs 原始 clean 数据
             loss_rec = criterion(X_rec_denoised, rec_clean)
             loss_hour = criterion(X_hour_denoised, hour_clean)
             loss_day = criterion(X_day_denoised, day_clean)
-            
-            # L_pretrain = Σ_k L_k
             loss = loss_rec + loss_hour + loss_day
 
         except Exception as e:
@@ -288,6 +251,7 @@ for epoch in range(start_epoch, epochs):
             traceback.print_exc()
             continue
 
+        # -------- 反向传播 & 优化 --------
         loss.backward()
         torch.nn.utils.clip_grad_norm_(md_params, max_norm=5.0)
         optimizer.step()
@@ -297,9 +261,8 @@ for epoch in range(start_epoch, epochs):
         global_step += 1
 
         if global_step % 50 == 0:
-            # 修正问题5：打印真实的损失值（已在上面计算）
-            print(f"周期 {epoch}, 步骤 {global_step}, "
-                  f"MD预训练总损失: {loss.item():.6f} "
+            print(f"Epoch {epoch}, Step {global_step}, "
+                  f"Loss: {loss.item():.6f} "
                   f"(rec={loss_rec.item():.6f}, hour={loss_hour.item():.6f}, day={loss_day.item():.6f})")
             if sw:
                 sw.add_scalar('pretrain/total_md_loss', loss.item(), global_step)
@@ -310,12 +273,9 @@ for epoch in range(start_epoch, epochs):
     if batch_count > 0:
         avg_loss = total_loss / batch_count
         epoch_time = time() - epoch_start_time
-        print(f"周期 {epoch} 完成. "
-              f"平均MD预训练损失: {avg_loss:.6f}, "
-              f"耗时: {epoch_time:.2f}秒, "
-              f"批次: {batch_count}")
-        
-        # 保存最佳模型（基于训练损失）
+        print(f"Epoch {epoch} 完成. 平均MD预训练损失: {avg_loss:.6f}, 耗时: {epoch_time:.2f}s, 批次: {batch_count}")
+
+        # 保存最佳模型
         if avg_loss < best_train_loss:
             best_train_loss = avg_loss
             best_epoch = epoch
@@ -324,7 +284,7 @@ for epoch in range(start_epoch, epochs):
             print(f"保存最佳MD模型到 {best_params_filename}")
     else:
         avg_loss = 0
-        print(f"周期 {epoch} 没有有效批次数据")
+        print(f"Epoch {epoch} 没有有效批次数据")
 
     # 保存当前周期模型
     params_filename = os.path.join(params_path, f'epoch_{epoch}.params')
